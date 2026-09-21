@@ -7,4 +7,5 @@ pub mod guest_run;
 pub mod host;
 pub mod machine;
 pub mod proc_status;
+pub mod seccomp;
 // (Further modules are added by the following tasks here.)
