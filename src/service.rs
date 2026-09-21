@@ -10,6 +10,9 @@
 //!   owned by a parent.
 //! * Seccomp is copied from the process (ptrace) and loaded last before exec.
 //! * The environment of the service is never copied — it can carry secrets.
+//! * The umask is copied (file-mode measurements depend on it); SIGPIPE is
+//!   reset to SIG_DFL, which Rust's runtime had set to SIG_IGN.
+//! * Not reproduced, and said so in the report line: LSM labels and rlimits.
 
 use crate::host::{Host, PROFILE};
 use crate::proc_status::{self, Status};
@@ -61,13 +64,14 @@ pub fn report_line(
         _ => ("none".to_string(), None),
     };
     let not = match not_sc {
-        None => "lsm".to_string(),
-        Some(e) => format!("lsm,seccomp ({e})"),
+        None => "lsm,rlimits".to_string(),
+        Some(e) => format!("lsm,rlimits,seccomp ({e})"),
     };
     format!(
-        "vantage: as {unit} (pid {guest_pid}): ns=all uid={uid} gid={gid} groups={} caps={:#x} {nnp} seccomp={sc} · NOT: {not}",
+        "vantage: as {unit} (pid {guest_pid}): ns=all uid={uid} gid={gid} groups={} caps={:#x} umask={:04o} {nnp} seccomp={sc} · NOT: {not}",
         gl.join(","),
-        st.cap_eff
+        st.cap_eff,
+        st.umask
     )
 }
 
@@ -75,8 +79,10 @@ fn cstr(s: &str) -> CString {
     CString::new(s).expect("no NUL in arguments")
 }
 
-fn fail(what: &str) -> ! {
-    eprintln!("vantage: {what}: {}", std::io::Error::last_os_error());
+/// `err` is captured by the caller right after the failing call, before
+/// anything (e.g. `format!`) can clobber errno.
+fn fail(what: &str, err: std::io::Error) -> ! {
+    eprintln!("vantage: {what}: {err}");
     unsafe { libc::_exit(crate::app::EXIT_TOOL) }
 }
 
@@ -94,6 +100,9 @@ struct CapData {
 }
 const CAP_V3: u32 = 0x2008_0522;
 
+/// Returns the program's exit code. On return the calling process has joined
+/// the service's namespaces, cgroup and supplementary groups: the caller
+/// must do nothing but exit with the returned code.
 pub fn run_as_service(
     h: &dyn Host,
     guest: &str,
@@ -194,24 +203,29 @@ pub fn run_as_service(
     unsafe {
         use std::os::fd::AsRawFd;
         if libc::setgroups(st.groups.len(), st.groups.as_ptr()) != 0 {
-            fail("setgroups (host gids)");
+            fail("setgroups (host gids)", std::io::Error::last_os_error());
         }
         for (n, f) in ns.iter().zip(&fds) {
             if libc::setns(f.as_raw_fd(), 0) != 0 {
-                fail(&format!("setns {n}"));
+                let e = std::io::Error::last_os_error();
+                fail(&format!("setns {n}"), e);
             }
         }
         let child = libc::fork();
         if child < 0 {
-            fail("fork");
+            fail("fork", std::io::Error::last_os_error());
         }
         if child > 0 {
             let mut s = 0;
             while libc::waitpid(child, &mut s, 0) < 0 {
-                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                    fail("waitpid");
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINTR) {
+                    fail("waitpid", e);
                 }
             }
+            // The parent is now inside the service's namespaces and cgroup
+            // (and carries its supplementary groups): the caller must do
+            // nothing with this process but exit with the returned code.
             return if libc::WIFEXITED(s) {
                 libc::WEXITSTATUS(s)
             } else {
@@ -223,17 +237,17 @@ pub fn run_as_service(
             if (st.cap_bnd >> cap) & 1 == 0
                 && libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) != 0
             {
-                fail("PR_CAPBSET_DROP");
+                fail("PR_CAPBSET_DROP", std::io::Error::last_os_error());
             }
         }
         if libc::setresgid(gid, gid, gid) != 0 {
-            fail("setresgid");
+            fail("setresgid", std::io::Error::last_os_error());
         }
         if libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0 {
-            fail("PR_SET_KEEPCAPS");
+            fail("PR_SET_KEEPCAPS", std::io::Error::last_os_error());
         }
         if libc::setresuid(uid, uid, uid) != 0 {
-            fail("setresuid");
+            fail("setresuid", std::io::Error::last_os_error());
         }
         let hdr = CapHeader {
             version: CAP_V3,
@@ -252,7 +266,7 @@ pub fn run_as_service(
             },
         ];
         if libc::syscall(libc::SYS_capset, &hdr, data.as_ptr()) != 0 {
-            fail("capset");
+            fail("capset", std::io::Error::last_os_error());
         }
         for cap in 0..=last_cap {
             if (st.cap_amb >> cap) & 1 == 1
@@ -264,15 +278,20 @@ pub fn run_as_service(
                     0,
                 ) != 0
             {
-                fail("PR_CAP_AMBIENT_RAISE");
+                fail("PR_CAP_AMBIENT_RAISE", std::io::Error::last_os_error());
             }
         }
         if (st.no_new_privs || nnp_added) && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
         {
-            fail("PR_SET_NO_NEW_PRIVS");
+            fail("PR_SET_NO_NEW_PRIVS", std::io::Error::last_os_error());
+        }
+        libc::umask(st.umask as libc::mode_t);
+        // Rust's runtime ignores SIGPIPE; a raw execve would pass that on.
+        if libc::signal(libc::SIGPIPE, libc::SIG_DFL) == libc::SIG_ERR {
+            fail("signal SIGPIPE", std::io::Error::last_os_error());
         }
         if libc::chdir(c"/".as_ptr()) != 0 {
-            fail("chdir /");
+            fail("chdir /", std::io::Error::last_os_error());
         }
         eprintln!("{report}");
         if let Err(e) = seccomp::load_filters(&filters) {
@@ -308,6 +327,7 @@ mod tests {
     fn report_says_what_is_reproduced_and_what_not() {
         let st = Status {
             cap_eff: 0x400,
+            umask: 0o002,
             no_new_privs: true,
             seccomp_mode: 2,
             ..Default::default()
@@ -320,7 +340,7 @@ mod tests {
         assert_eq!(
             l,
             "vantage: as sftpgo.service (pid 284): ns=all uid=950 gid=9000 \
-                       groups=9000,950,+109000(unmapped) caps=0x400 nnp seccomp=36 · NOT: lsm"
+                       groups=9000,950,+109000(unmapped) caps=0x400 umask=0002 nnp seccomp=36 · NOT: lsm,rlimits"
         );
         let l = report_line(
             "x.service",
@@ -337,7 +357,7 @@ mod tests {
         );
         assert!(l.contains("nnp(added)"), "{l}");
         assert!(
-            l.ends_with("NOT: lsm,seccomp (PTRACE_SEIZE: Operation not permitted)"),
+            l.ends_with("NOT: lsm,rlimits,seccomp (PTRACE_SEIZE: Operation not permitted)"),
             "{l}"
         );
         let none = Status {
@@ -357,6 +377,7 @@ mod tests {
             &Ok(0),
             false,
         );
-        assert!(l.contains("no-nnp seccomp=none"), "{l}");
+        assert!(l.contains("umask=0022 no-nnp seccomp=none"), "{l}");
+        assert!(l.ends_with("NOT: lsm,rlimits"), "{l}");
     }
 }

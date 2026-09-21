@@ -2,7 +2,7 @@
 //! IDs in status are host IDs (the reader's namespace); the map translates
 //! them into the IDs of the process's own user namespace.
 
-#[derive(Debug, Default, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Status {
     pub uid: u32,
     pub gid: u32,
@@ -16,6 +16,28 @@ pub struct Status {
     pub seccomp_mode: u32,
     pub seccomp_filters: u32,
     pub nspid: Vec<u32>,
+    /// File mode creation mask (octal in status). 0o022 if the kernel does not report it.
+    pub umask: u32,
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Status {
+            uid: 0,
+            gid: 0,
+            groups: vec![],
+            cap_inh: 0,
+            cap_prm: 0,
+            cap_eff: 0,
+            cap_bnd: 0,
+            cap_amb: 0,
+            no_new_privs: false,
+            seccomp_mode: 0,
+            seccomp_filters: 0,
+            nspid: vec![],
+            umask: 0o022,
+        }
+    }
 }
 
 fn nums(s: &str) -> Vec<u32> {
@@ -47,6 +69,7 @@ pub fn parse(s: &str) -> Status {
             "Seccomp" => st.seccomp_mode = v.trim().parse().unwrap_or(0),
             "Seccomp_filters" => st.seccomp_filters = v.trim().parse().unwrap_or(0),
             "NSpid" => st.nspid = nums(v),
+            "Umask" => st.umask = u32::from_str_radix(v.trim(), 8).unwrap_or(0o022),
             _ => {}
         }
     }
@@ -78,6 +101,11 @@ mod tests {
     const SONARR_GID_MAP: &str = include_str!("../tests/fixtures/gid_map-sonarr.txt");
 
     #[test]
+    fn umask_defaults_to_022_when_absent() {
+        assert_eq!(parse("Uid:\t1\t1\t1\t1\n").umask, 0o022);
+    }
+
+    #[test]
     fn parses_the_recorded_sftpgo_status() {
         let s = parse(SFTPGO);
         assert_eq!(s.uid, 700950);
@@ -87,6 +115,7 @@ mod tests {
         assert_eq!(s.seccomp_mode, 2);
         assert_eq!(s.seccomp_filters, 36);
         assert_eq!(s.nspid.len(), 2);
+        assert_eq!(s.umask, 0o002, "recorded: 'Umask:\t0002'");
         // Recorded fixture: NSpid ends on 194, not the 284 the plan guessed.
         assert_eq!(*s.nspid.last().unwrap(), 194);
     }

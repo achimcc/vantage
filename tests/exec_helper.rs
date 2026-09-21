@@ -64,3 +64,61 @@ fn missing_program_is_127_unreadable_file_is_125() {
         .unwrap();
     assert_eq!(out.status.code(), Some(125));
 }
+
+/// SigIgn of the shell that runs this script, as hex from /proc/$$/status.
+fn sigign_script(dir: &std::path::Path) -> std::path::PathBuf {
+    let p = dir.join("sigign");
+    std::fs::write(
+        &p,
+        "#!/bin/sh\nwhile read -r k v; do [ \"$k\" = SigIgn: ] && echo \"SIGIGN=$v\"; done < /proc/$$/status\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+fn sigpipe_ignored(stdout: &[u8]) -> bool {
+    let so = String::from_utf8_lossy(stdout);
+    let hex = so
+        .lines()
+        .find_map(|l| l.strip_prefix("SIGIGN="))
+        .unwrap_or_else(|| panic!("no SigIgn line in {so:?}"));
+    // Signal 13 is bit 12 of the mask.
+    u64::from_str_radix(hex.trim(), 16).unwrap() & (1 << (libc::SIGPIPE - 1)) != 0
+}
+
+#[test]
+fn exec_hands_the_program_sigpipe_at_default() {
+    let d = tempfile::tempdir().unwrap();
+    let script = sigign_script(d.path());
+
+    // Positive control: the measurement sees an ignored SIGPIPE.
+    use std::os::unix::process::CommandExt;
+    let mut c = Command::new(&script);
+    unsafe {
+        c.pre_exec(|| {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let ctl = c.output().unwrap();
+    assert!(
+        sigpipe_ignored(&ctl.stdout),
+        "control: SIG_IGN must be visible"
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_vantage"))
+        .args(["__exec", "--header", "A: b", "--"])
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !sigpipe_ignored(&out.stdout),
+        "the program must not inherit Rust's SIG_IGN for SIGPIPE"
+    );
+}
