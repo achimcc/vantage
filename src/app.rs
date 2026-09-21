@@ -13,8 +13,9 @@ vantage — measure inside a systemd-nspawn guest from the right vantage point
   vantage probe --from <guest> <target-guest>:<port> [--path /p] [-6]
   vantage where <guest>
 
-Runs on the host as root. Exit: the program's code; 125 tool error, 126 not
-executable, 127 not in the guest's profile. probe: 0 answered, 1 finding, 2 tool error.
+Runs on the host as root. Exit: the program's code; 125 tool error, 127 not in
+the guest's profile (systemd's 203/EXEC), 126 not executable (only where vantage
+execs itself: --as-service, __exec). probe: 0 answered, 1 finding, 2 tool error.
 ";
 
 pub fn main(argv: &[String]) -> i32 {

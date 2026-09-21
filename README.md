@@ -41,14 +41,32 @@ not `127.0.0.1`.
 `--header` and `--header-file` only work with `curl`. Before anything runs,
 `vantage` refuses a curl argument that would put a header or credential into
 argv — `-H`/`--header`, `-u`/`--user`, `-U`/`--proxy-user`,
-`--proxy-header`, `--oauth2-bearer`, their unambiguous abbreviations, and
-`-K -`/`--config -` — because that argv ends up in the guest's journal via
+`--proxy-header`, `--oauth2-bearer`, their unambiguous abbreviations, their
+`--expand-` forms (curl ≥ 8.3 accepts `--expand-header`, `--expand-user`, …),
+and `-K -`/`--config -` — because that argv ends up in the guest's journal via
 the transient unit's start line. `--header 'Name: value'` **does** still
 appear in argv itself, so it is only for headers that carry nothing secret
 (`Accept`, `Content-Type`, …). An actual secret goes through
 `--header-file 'Name=/path/in/guest'`: only the *path* is in argv, never the
 value. `vantage` reads that file *inside* the guest and hands curl a curlrc
 over a memfd (`-K /proc/self/fd/<n>`), so the value is in no argv at all.
+
+With a `--header-file`, `vantage` also refuses the curl options that print
+the request headers — and with them the secret — to the terminal or a trace
+file: `-v`/`--verbose` (also inside a cluster such as `-sv`), `--trace`,
+`--trace-ascii`, `--trace-config` and `--libcurl`, again including
+abbreviations and `--expand-` forms.
+
+**A secret in the URL is not protected.** `curl 'http://…/api?apikey=…'`
+puts the key into argv like `-H` would, and from there into the guest's
+journal — `vantage` does not parse URLs. Send the key as a header with
+`--header-file` instead (most APIs that take `?apikey=` also take
+`X-Api-Key:`).
+
+Plain `run` with headers re-enters the guest through vantage's own store
+path (`vantage __exec`, which reads the files and execs curl), so only this
+case needs the guest to share the host's `/nix/store`. With `--as-service`
+there is no re-exec: the forked child reads the files itself (see below).
 
 #### `--as-service <unit>`
 
@@ -78,11 +96,27 @@ over every child namespace only until it joins `user`:
   ambient;
 - **`no_new_privs`** (and, if the service carries seccomp filters but had
   not set it itself, `nnp(added)`);
+- the **root directory** — `/proc/<pid>/root` is opened before the namespace
+  switch and the child `chroot`s into it, so a unit with `RootDirectory=`
+  (NixOS `confinement.enable`) sees its own root, not the guest's. The
+  report line says `root=own` when that root differs from the root of the
+  mount namespace. Inside such a root only what the unit mounts exists: the
+  program has to be there too, or it is 127;
 - **umask** (file-mode measurements depend on it);
 - **seccomp filters**, copied from the live process via `ptrace` and loaded
   back in the same order (index 0 is the most recently installed filter, so
   they load from the highest index down), as the very last step before
   `execve`.
+
+With `--header`/`--header-file`, the forked child — already as the service
+user, in the service's mount namespace and root, before the seccomp filters
+are loaded — reads the files, writes the curlrc into a memfd and execs curl
+with `-K /proc/self/fd/<n>`. So `--header-file` paths are the paths *the
+service* sees, and a file the service may not read is an error (125).
+
+If the service restarts while `vantage` sets up (its main pid no longer
+matches after the namespaces are opened), `vantage` stops with 125 and
+"try again" instead of joining a stranger.
 
 Not reproduced, and said so on the report line after `NOT:`: **LSM labels**
 and **rlimits**. The service's own **environment is never copied** — it can
@@ -97,22 +131,26 @@ $ vantage probe --from web db:5432
 ```
 
 Runs `curl` inside `<guest>` against the target guest's zone address and
-port, and turns the result into one of five verdicts:
+port (`-w '%{http_code} %{time_connect}' --max-time 6`), and turns the
+result into one of these verdicts:
 
 | curl result | verdict | exit |
 |---|---|---|
 | HTTP answer (exit 0) | answered | 0 |
 | TCP connected, no full HTTP answer (exit 35, 52 or 56) | answered — "no HTTP response (curl exit …)" | 0 |
-| connection refused (exit 7) | refused — nothing listens, or the target's own firewall rejects | 1 |
-| timeout (exit 28), host's drop log matches this probe | dropped at zone edge | 1 |
-| timeout (exit 28), `drop_log_prefix` configured but no match | dropped elsewhere — the source's egress lock or the target's own firewall | 1 |
-| timeout (exit 28), no `drop_log_prefix` configured | timed out — zone edge vs. elsewhere unknown | 1 |
-| anything else (curl not in the guest's profile, journalctl failure, …) | tool error | 2 |
+| timeout (exit 28) *after* the connection was accepted (`time_connect` > 0) | answered — "no HTTP response within 6 s": a slow service, the path is open | 0 |
+| exit 7 | refused (connection refused or host unreachable) — nothing listens, the target's firewall rejects, or an ICMP reject/EHOSTUNREACH; curl's own first stderr line follows and says which | 1 |
+| connect timeout (exit 28, `time_connect` 0), host's drop log matches this probe | dropped at zone edge | 1 |
+| connect timeout, `drop_log_prefix` configured but no match | dropped elsewhere — the source's egress lock or the target's own firewall | 1 |
+| connect timeout, no `drop_log_prefix` configured | timed out — zone edge vs. elsewhere unknown | 1 |
+| anything else (curl not in the guest's profile, journalctl failure, a second exit 45, …) | tool error | 2 |
 
 `vantage` picks curl's own source port (`--local-port`) itself rather than
 letting the kernel choose one, because `%{local_port}` is empty after a
 connect timeout and the kernel's drop-log line has to be matched back to
-*this* probe and no other, by `SRC=`/`DST=`/`SPT=`/`DPT=`. Telling a
+*this* probe and no other, by prefix, `DST=`, `SPT=` and `DPT=` (not `SRC=`:
+a guest can have several addresses). If that port is taken (curl exit 45),
+the probe is retried once with a second port. Telling a
 dropped-at-the-edge timeout from any other timeout needs
 `/etc/vantage.toml`:
 
@@ -140,18 +178,29 @@ are running there right now.
 
 ## Exit codes
 
-`run`: the program's own exit code; **125** tool error, **126** not
-executable, **127** not found in the guest's profile (including a bare
-`203`/`EXEC` from `systemd-run`, translated).
+`run`: the program's own exit code; **125** tool error, **127** program not
+found in the guest's profile, **126** program not executable.
+
+- For plain `run`, `systemd-run` reports a program it cannot start as
+  `203`/`EXEC` — ENOENT and EACCES alike — and `vantage` turns that into
+  **127**. A `203` for vantage *itself* (the `__exec` re-entry with headers)
+  means the guest cannot see vantage's store path: **125**, "store not
+  shared?".
+- **126** comes only from paths where vantage itself calls `execve`:
+  `--as-service`, and `vantage __exec` for plain `run` with headers.
+- A program killed by signal *n*: **128+n** with `--as-service`; otherwise
+  whatever `systemd-run` reports.
 
 `probe`: **0** answered, **1** a finding (refused / dropped / timed out),
-**2** tool error.
+**2** tool error — including a command line that does not parse.
 
 ## Limits
 
-- Only works against **systemd-nspawn guests that share the host's
-  `/nix/store`** — `vantage` re-enters the guest through its own store path,
-  and refuses to run from anywhere else.
+- Only works against **systemd-nspawn guests**. Plain `run` with
+  `--header`/`--header-file` re-enters the guest through vantage's own
+  store path, so that case needs a guest that shares the host's
+  `/nix/store`, and a `vantage` that runs from `/nix/store` (it refuses to
+  otherwise). Without headers, and with `--as-service`, it does not.
 - Runs as **root on the host**.
 - `--as-service` does not reproduce **LSM labels** or **rlimits**; the
   report line says so.
