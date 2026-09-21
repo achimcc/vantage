@@ -157,6 +157,64 @@ mod tests {
         assert_eq!(code, 0);
     }
 
+    /// A skip is allowed only for a refusal on permission grounds: EPERM or
+    /// EACCES from PTRACE_SEIZE (no ptrace rights over the child), or EACCES
+    /// from the first PTRACE_SECCOMP_GET_FILTER while the test lacks
+    /// CAP_SYS_ADMIN — the kernel's own check for that request, and the
+    /// normal case for a non-root `cargo test` or a Nix builder.
+    fn may_skip(e: &str, has_sys_admin: bool) -> bool {
+        let denied = e.contains("Operation not permitted") || e.contains("Permission denied");
+        (e.starts_with("PTRACE_SEIZE:") && denied)
+            || (!has_sys_admin
+                && e.starts_with("PTRACE_SECCOMP_GET_FILTER[0]:")
+                && e.contains("Permission denied"))
+    }
+
+    /// CAP_SYS_ADMIN (bit 21) in this process's effective set.
+    fn has_sys_admin() -> bool {
+        let st = std::fs::read_to_string("/proc/self/status").unwrap();
+        crate::proc_status::parse(&st).cap_eff & (1 << 21) != 0
+    }
+
+    #[test]
+    fn only_a_permission_refusal_may_skip() {
+        assert!(may_skip(
+            "PTRACE_SEIZE: Operation not permitted (os error 1)",
+            true
+        ));
+        assert!(may_skip(
+            "PTRACE_SEIZE: Permission denied (os error 13)",
+            true
+        ));
+        assert!(may_skip(
+            "PTRACE_SECCOMP_GET_FILTER[0]: Permission denied (os error 13)",
+            false
+        ));
+        assert!(
+            !may_skip(
+                "PTRACE_SECCOMP_GET_FILTER[0]: Permission denied (os error 13)",
+                true
+            ),
+            "with CAP_SYS_ADMIN a refused read is a failure"
+        );
+        assert!(!may_skip(
+            "PTRACE_INTERRUPT: Operation not permitted (os error 1)",
+            false
+        ));
+        assert!(!may_skip(
+            "PTRACE_SECCOMP_GET_FILTER[0]: Invalid argument (os error 22)",
+            false
+        ));
+        assert!(!may_skip(
+            "PTRACE_SECCOMP_GET_FILTER[1]: Permission denied (os error 13)",
+            false
+        ));
+        assert!(!may_skip(
+            "PTRACE_SEIZE: No such process (os error 3)",
+            false
+        ));
+    }
+
     #[test]
     fn filters_read_back_as_loaded_or_skip_with_reason() {
         unsafe {
@@ -178,12 +236,10 @@ mod tests {
                     assert_eq!(f[0].0.len(), 4);
                 }
                 Err(e) => {
-                    // PTRACE_SECCOMP_GET_FILTER needs CAP_SYS_ADMIN in the initial
-                    // namespace; the server acceptance (Task 12) is the real proof.
-                    assert!(
-                        e.contains("Operation not permitted") || e.contains("PTRACE"),
-                        "{e}"
-                    );
+                    // Only a permission refusal skips (see may_skip); the
+                    // server acceptance is the real proof. Anything else is
+                    // a failure, not a skip.
+                    assert!(may_skip(&e, has_sys_admin()), "read-back failed: {e}");
                     eprintln!("SKIPPED read-back: {e}");
                 }
             }
