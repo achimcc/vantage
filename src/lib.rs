@@ -8,4 +8,5 @@ pub mod host;
 pub mod machine;
 pub mod proc_status;
 pub mod seccomp;
+pub mod service;
 // (Further modules are added by the following tasks here.)

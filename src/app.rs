@@ -56,9 +56,21 @@ fn run(r: &crate::cli::RunArgs) -> i32 {
         eprintln!("vantage: {e}");
         return EXIT_TOOL;
     }
-    if r.as_service.is_some() {
-        eprintln!("vantage: --as-service not implemented yet");
-        return EXIT_TOOL;
+    if let Some(unit) = &r.as_service {
+        let h = crate::host::Real;
+        if r.header_files.is_empty() && r.headers.is_empty() {
+            return crate::service::run_as_service(&h, &r.guest, unit, &r.program, &r.args);
+        }
+        return match g::self_exe() {
+            Ok(me) => {
+                let (p, a) = g::exec_args(&me, r);
+                crate::service::run_as_service(&h, &r.guest, unit, &p, &a)
+            }
+            Err(e) => {
+                eprintln!("vantage: {e}");
+                EXIT_TOOL
+            }
+        };
     }
     if r.header_files.is_empty() && r.headers.is_empty() {
         return g::run_in_guest(&r.guest, &g::resolve_program(&r.program), &r.args);
