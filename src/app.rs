@@ -39,6 +39,13 @@ fn dispatch(cmd: Cmd) -> i32 {
     match cmd {
         Cmd::Exec(a) => crate::exec::run(&a),
         Cmd::Run(r) => run(&r),
+        Cmd::Probe(a) => match crate::config::load() {
+            Ok(cfg) => crate::probe::probe(&crate::host::Real, &cfg, &a),
+            Err(e) => {
+                eprintln!("vantage: {e}");
+                2
+            }
+        },
         _ => {
             eprintln!("vantage: not implemented yet");
             EXIT_TOOL
