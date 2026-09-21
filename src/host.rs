@@ -88,6 +88,17 @@ pub mod fake {
             );
             self
         }
+        pub fn on_err(mut self, cmd: &str, code: i32, stdout: &str, stderr: &str) -> Self {
+            self.cmds.insert(
+                cmd.to_string(),
+                Out {
+                    code,
+                    stdout: stdout.into(),
+                    stderr: stderr.into(),
+                },
+            );
+            self
+        }
         pub fn file(mut self, path: &str, content: &str) -> Self {
             self.files.insert(path.to_string(), content.to_string());
             self
