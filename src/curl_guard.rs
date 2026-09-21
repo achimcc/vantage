@@ -13,6 +13,10 @@ const FORBIDDEN_LONG: &[&str] = &[
     "--oauth2-bearer",
     "--proxy-header",
 ];
+/// Real curl options in their own right that happen to be prefixes of a
+/// forbidden name (`--head` of `--header`, `--proxy` of `--proxy-user` and
+/// `--proxy-header`) and must stay allowed despite the prefix rule below.
+const LONG_PREFIX_EXCEPTIONS: &[&str] = &["--head", "--proxy"];
 const FORBIDDEN_SHORT: &[char] = &['H', 'u', 'U'];
 /// Short options that take a value: the rest of the cluster is that value.
 const SHORT_WITH_VALUE: &str = "AbcCdDeEFHKmoPQrtTuUwxXyYz";
@@ -28,6 +32,25 @@ pub fn is_curl(program: &str) -> bool {
     program.rsplit('/').next() == Some("curl")
 }
 
+/// curl accepts unambiguous prefix abbreviations of long options
+/// (`--heade` for `--header`, `--proxy-h` for `--proxy-header`, `--oauth`
+/// for `--oauth2-bearer`, ...); a name that is a strict-or-equal prefix of
+/// a forbidden option is refused too, so an abbreviation can't slip past.
+/// `--head` and `--proxy` are excluded: real curl options of their own.
+fn is_forbidden_long(name: &str) -> bool {
+    if LONG_PREFIX_EXCEPTIONS.contains(&name) {
+        return false;
+    }
+    FORBIDDEN_LONG.iter().any(|f| f.starts_with(name))
+}
+
+/// Same idea for `--config`: `--conf`/`--confi`/... also select it. A
+/// minimum length of six keeps shorter, more ambiguous prefixes (`--con`,
+/// `--co`) out of scope — they are not exercised by curl's own matcher here.
+fn is_config_option(name: &str) -> bool {
+    name == "--config" || ("--config".starts_with(name) && name.len() >= 6)
+}
+
 pub fn check(args: &[String]) -> Result<(), String> {
     for (i, a) in args.iter().enumerate() {
         if let Some(long) = a.strip_prefix("--") {
@@ -38,10 +61,10 @@ pub fn check(args: &[String]) -> Result<(), String> {
                 Some((n, v)) => (n, Some(v)),
                 None => (a.as_str(), None),
             };
-            if FORBIDDEN_LONG.contains(&name) {
+            if is_forbidden_long(name) {
                 return Err(refuse(name));
             }
-            if name == "--config" {
+            if is_config_option(name) {
                 let v = inline.or(args.get(i + 1).map(String::as_str));
                 if v == Some("-") {
                     return Err(refuse("--config -"));
@@ -134,5 +157,27 @@ mod tests {
         assert!(is_curl("curl"));
         assert!(is_curl("/run/current-system/sw/bin/curl"));
         assert!(!is_curl("/bin/curly"));
+    }
+    #[test]
+    fn long_option_abbreviations_refused() {
+        for a in [
+            &["--heade", "X"][..],
+            &["--proxy-h", "X"],
+            &["--oauth", "t"],
+            &["--us=a:b"],
+        ] {
+            assert!(check(&v(a)).is_err(), "{a:?} must be refused");
+        }
+    }
+    #[test]
+    fn config_abbreviation_from_stdin_refused() {
+        assert!(check(&v(&["--conf", "-"])).is_err());
+    }
+    #[test]
+    fn own_options_that_are_prefixes_stay_allowed() {
+        assert!(check(&v(&["--head"])).is_ok());
+        assert!(check(&v(&["--proxy", "http://p"])).is_ok());
+        assert!(check(&v(&["--user-agent", "x"])).is_ok());
+        assert!(check(&v(&["--conf", "/run/rc"])).is_ok());
     }
 }
