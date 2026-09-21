@@ -30,7 +30,12 @@ pub fn main(argv: &[String]) -> i32 {
         Ok(cmd) => dispatch(cmd),
         Err(e) => {
             eprintln!("vantage: {e}\n\n{USAGE}");
-            EXIT_TOOL
+            // probe's tool errors are 2 (0 answered, 1 finding); 125 is run's.
+            if argv.first().map(String::as_str) == Some("probe") {
+                2
+            } else {
+                EXIT_TOOL
+            }
         }
     }
 }
@@ -87,16 +92,35 @@ fn run(r: &crate::cli::RunArgs) -> i32 {
         };
     }
     if r.header_files.is_empty() && r.headers.is_empty() {
-        return g::run_in_guest(&r.guest, &g::resolve_program(&r.program), &r.args);
+        return g::run_in_guest(&r.guest, &g::resolve_program(&r.program), &r.args, false);
     }
     match g::self_exe() {
         Ok(me) => {
             let (p, a) = g::exec_args(&me, r);
-            g::run_in_guest(&r.guest, &p, &a)
+            g::run_in_guest(&r.guest, &p, &a, true)
         }
         Err(e) => {
             eprintln!("vantage: {e}");
             EXIT_TOOL
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+    #[test]
+    fn probe_parse_errors_are_probe_tool_errors() {
+        assert_eq!(main(&v(&["probe", "b:80"])), 2, "--from missing");
+        assert_eq!(main(&v(&["probe", "--from", "a", "b:x"])), 2);
+        assert_eq!(main(&v(&["probe", "--bogus"])), 2);
+    }
+    #[test]
+    fn other_parse_errors_stay_125() {
+        assert_eq!(main(&v(&["run", "g"])), EXIT_TOOL);
+        assert_eq!(main(&v(&["frobnicate"])), EXIT_TOOL);
     }
 }

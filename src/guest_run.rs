@@ -78,19 +78,39 @@ pub fn self_exe() -> Result<String, String> {
     Ok(s)
 }
 
-/// Runs with inherited stdio; returns the program's exit code.
-pub fn run_in_guest(guest: &str, program: &str, args: &[String]) -> i32 {
+/// systemd-run's 203/EXEC, translated. systemd reports ENOENT and EACCES
+/// alike as 203, so for the program itself this is always 127. If the
+/// program was vantage re-entering itself (`reexec`), the guest cannot see
+/// vantage's store path — a tool error, not a missing program.
+pub fn exec_203(guest: &str, program: &str, reexec: bool) -> (i32, String) {
+    if reexec {
+        return (
+            crate::app::EXIT_TOOL,
+            format!(
+                "vantage: vantage's store path is not visible in {guest} (store not shared?) \
+                 — {program} (203/EXEC)"
+            ),
+        );
+    }
+    let name = program.rsplit('/').next().unwrap_or(program);
+    (
+        127,
+        format!("vantage: `{name}` is not in the profile of {guest} (203/EXEC) — {program}"),
+    )
+}
+
+/// Runs with inherited stdio; returns the program's exit code. `reexec`:
+/// `program` is vantage itself (`__exec`), not the user's program.
+pub fn run_in_guest(guest: &str, program: &str, args: &[String], reexec: bool) -> i32 {
     let st = std::process::Command::new(format!("{PROFILE}/systemd-run"))
         .args(systemd_run_argv(guest, program, args))
         .status();
     match st {
         Ok(s) => match s.code() {
             Some(203) => {
-                let name = program.rsplit('/').next().unwrap_or(program);
-                eprintln!(
-                    "vantage: `{name}` is not in the profile of {guest} (203/EXEC) — {program}"
-                );
-                127
+                let (code, msg) = exec_203(guest, program, reexec);
+                eprintln!("{msg}");
+                code
             }
             Some(c) => c,
             None => crate::app::EXIT_TOOL,
@@ -171,6 +191,25 @@ mod tests {
         r.program = "wget".into();
         r.headers = v(&["A: b"]);
         assert!(validate(&r).unwrap_err().contains("curl"));
+    }
+    #[test]
+    fn exec_203_of_the_program_is_127() {
+        let (c, m) = exec_203("signal-01", "/run/current-system/sw/bin/signal-cli", false);
+        assert_eq!(c, 127);
+        assert!(
+            m.contains("`signal-cli` is not in the profile of signal-01"),
+            "{m}"
+        );
+    }
+    #[test]
+    fn exec_203_of_vantage_itself_is_a_tool_error() {
+        let (c, m) = exec_203("g", "/nix/store/abc-vantage/bin/vantage", true);
+        assert_eq!(c, 125);
+        assert!(
+            m.contains("vantage's store path is not visible in g (store not shared?)"),
+            "{m}"
+        );
+        assert!(!m.contains("profile"), "{m}");
     }
     #[test]
     fn verbose_refused_only_with_a_header_file() {
