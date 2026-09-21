@@ -1,0 +1,61 @@
+Name:	sftpgo
+Umask:	0002
+State:	S (sleeping)
+Tgid:	3034571
+Ngid:	0
+Pid:	3034571
+PPid:	3033601
+TracerPid:	0
+Uid:	700950	700950	700950	700950
+Gid:	709000	709000	709000	709000
+FDSize:	128
+Groups:	700950 709000 
+NStgid:	3034571	194
+NSpid:	3034571	194
+NSpgid:	3034571	194
+NSsid:	3034571	194
+Kthread:	0
+VmPeak:	 2115772 kB
+VmSize:	 2115772 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	   55408 kB
+VmRSS:	   55408 kB
+RssAnon:	   32476 kB
+RssFile:	   22932 kB
+RssShmem:	       0 kB
+VmData:	  245136 kB
+VmStk:	     132 kB
+VmExe:	   29356 kB
+VmLib:	    1764 kB
+VmPTE:	     416 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	17
+SigQ:	0/256491
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000000000
+SigCgt:	fffffffd7fc1feff
+CapInh:	0000000000000400
+CapPrm:	0000000000000400
+CapEff:	0000000000000400
+CapBnd:	0000000000000400
+CapAmb:	0000000000000400
+NoNewPrivs:	1
+Seccomp:	2
+Seccomp_filters:	36
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	fff
+Cpus_allowed_list:	0-11
+Mems_allowed:	00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	341
+nonvoluntary_ctxt_switches:	201
+x86_Thread_features:	
+x86_Thread_features_locked:	

@@ -3,4 +3,7 @@ pub mod cli;
 pub mod curl_guard;
 pub mod curlrc;
 pub mod exec;
+pub mod host;
+pub mod machine;
+pub mod proc_status;
 // (Further modules are added by the following tasks here.)

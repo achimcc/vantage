@@ -1,0 +1,61 @@
+Name:	Sonarr
+Umask:	0002
+State:	S (sleeping)
+Tgid:	1940300
+Ngid:	0
+Pid:	1940300
+PPid:	1933731
+TracerPid:	0
+Uid:	100274	100274	100274	100274
+Gid:	100274	100274	100274	100274
+FDSize:	512
+Groups:	100274 109000 
+NStgid:	1940300	251
+NSpid:	1940300	251
+NSpgid:	1940300	251
+NSsid:	1940300	251
+Kthread:	0
+VmPeak:	275040136 kB
+VmSize:	274933568 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	  350060 kB
+VmRSS:	  314972 kB
+RssAnon:	  195792 kB
+RssFile:	   46188 kB
+RssShmem:	   72992 kB
+VmData:	  426360 kB
+VmStk:	     132 kB
+VmExe:	      44 kB
+VmLib:	   92992 kB
+VmPTE:	    1332 kB
+VmSwap:	   12420 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	21
+SigQ:	0/256491
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000001000
+SigCgt:	00000003000344fe
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	0000000000000000
+CapAmb:	0000000000000000
+NoNewPrivs:	1
+Seccomp:	2
+Seccomp_filters:	36
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	fff
+Cpus_allowed_list:	0-11
+Mems_allowed:	00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	1646
+nonvoluntary_ctxt_switches:	2391
+x86_Thread_features:	
+x86_Thread_features_locked:	
