@@ -38,8 +38,38 @@ pub fn main(argv: &[String]) -> i32 {
 fn dispatch(cmd: Cmd) -> i32 {
     match cmd {
         Cmd::Exec(a) => crate::exec::run(&a),
+        Cmd::Run(r) => run(&r),
         _ => {
             eprintln!("vantage: not implemented yet");
+            EXIT_TOOL
+        }
+    }
+}
+
+fn run(r: &crate::cli::RunArgs) -> i32 {
+    use crate::guest_run as g;
+    if let Err(e) = g::validate(r) {
+        eprintln!("vantage: {e}");
+        return EXIT_TOOL;
+    }
+    if let Err(e) = crate::machine::leader(&crate::host::Real, &r.guest) {
+        eprintln!("vantage: {e}");
+        return EXIT_TOOL;
+    }
+    if r.as_service.is_some() {
+        eprintln!("vantage: --as-service not implemented yet");
+        return EXIT_TOOL;
+    }
+    if r.header_files.is_empty() && r.headers.is_empty() {
+        return g::run_in_guest(&r.guest, &g::resolve_program(&r.program), &r.args);
+    }
+    match g::self_exe() {
+        Ok(me) => {
+            let (p, a) = g::exec_args(&me, r);
+            g::run_in_guest(&r.guest, &p, &a)
+        }
+        Err(e) => {
+            eprintln!("vantage: {e}");
             EXIT_TOOL
         }
     }
