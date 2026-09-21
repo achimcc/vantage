@@ -35,7 +35,12 @@ pub fn main(argv: &[String]) -> i32 {
     }
 }
 
-fn dispatch(_cmd: Cmd) -> i32 {
-    eprintln!("vantage: not implemented yet");
-    EXIT_TOOL
+fn dispatch(cmd: Cmd) -> i32 {
+    match cmd {
+        Cmd::Exec(a) => crate::exec::run(&a),
+        _ => {
+            eprintln!("vantage: not implemented yet");
+            EXIT_TOOL
+        }
+    }
 }
