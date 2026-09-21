@@ -58,6 +58,9 @@ pub fn validate(r: &RunArgs) -> Result<(), String> {
     }
     if curl_guard::is_curl(&r.program) {
         curl_guard::check(&r.args)?;
+        if !r.header_files.is_empty() {
+            curl_guard::check_no_echo(&r.args)?;
+        }
     }
     Ok(())
 }
@@ -168,5 +171,21 @@ mod tests {
         r.program = "wget".into();
         r.headers = v(&["A: b"]);
         assert!(validate(&r).unwrap_err().contains("curl"));
+    }
+    #[test]
+    fn verbose_refused_only_with_a_header_file() {
+        let mut r = RunArgs {
+            guest: "g".into(),
+            program: "curl".into(),
+            args: v(&["-sv", "http://x/"]),
+            ..Default::default()
+        };
+        assert!(validate(&r).is_ok(), "no secret in play: -v is fine");
+        r.headers = v(&["Accept: a"]);
+        assert!(validate(&r).is_ok(), "a plain --header is in argv anyway");
+        r.header_files = vec![("X-Api-Key".into(), "/run/k".into())];
+        assert!(validate(&r).unwrap_err().contains("-v"));
+        r.args = v(&["--trace-ascii", "-", "http://x/"]);
+        assert!(validate(&r).unwrap_err().contains("--trace-ascii"));
     }
 }
