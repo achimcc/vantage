@@ -76,20 +76,17 @@ fn run(r: &crate::cli::RunArgs) -> i32 {
         return EXIT_TOOL;
     }
     if let Some(unit) = &r.as_service {
-        let h = crate::host::Real;
-        if r.header_files.is_empty() && r.headers.is_empty() {
-            return crate::service::run_as_service(&h, &r.guest, unit, &r.program, &r.args);
-        }
-        return match g::self_exe() {
-            Ok(me) => {
-                let (p, a) = g::exec_args(&me, r);
-                crate::service::run_as_service(&h, &r.guest, unit, &p, &a)
-            }
-            Err(e) => {
-                eprintln!("vantage: {e}");
-                EXIT_TOOL
-            }
-        };
+        // Headers are handled by the forked child itself (as the service
+        // user, in its namespaces and root) — no re-exec of vantage here.
+        return crate::service::run_as_service(
+            &crate::host::Real,
+            &r.guest,
+            unit,
+            &r.program,
+            &r.args,
+            &r.headers,
+            &r.header_files,
+        );
     }
     if r.header_files.is_empty() && r.headers.is_empty() {
         return g::run_in_guest(&r.guest, &g::resolve_program(&r.program), &r.args, false);

@@ -12,6 +12,14 @@
 //! * The environment of the service is never copied — it can carry secrets.
 //! * The umask is copied (file-mode measurements depend on it); SIGPIPE is
 //!   reset to SIG_DFL, which Rust's runtime had set to SIG_IGN.
+//! * The root directory is reproduced: `/proc/<pid>/root` is opened before
+//!   the namespace switch and the child chroots into it, so a unit with
+//!   `RootDirectory=` (e.g. `confinement.enable`) sees its own root. The
+//!   report line says `root=own` when that root differs from the root of
+//!   the mount namespace.
+//! * With --header/--header-file the child itself — as the service user, in
+//!   the service's mount namespace and root — reads the files and hands curl
+//!   a curlrc in a memfd; there is no re-exec of vantage on this path.
 //! * Not reproduced, and said so in the report line: LSM labels and rlimits.
 
 use crate::host::{Host, PROFILE};
@@ -48,6 +56,7 @@ pub fn report_line(
     st: &Status,
     seccomp: &Result<usize, String>,
     nnp_added: bool,
+    root_own: bool,
 ) -> String {
     let mut gl: Vec<String> = groups.inner.iter().map(|g| g.to_string()).collect();
     gl.extend(groups.unmapped.iter().map(|g| format!("+{g}(unmapped)")));
@@ -67,12 +76,20 @@ pub fn report_line(
         None => "lsm,rlimits".to_string(),
         Some(e) => format!("lsm,rlimits,seccomp ({e})"),
     };
+    let root = if root_own { " root=own" } else { "" };
     format!(
-        "vantage: as {unit} (pid {guest_pid}): ns=all uid={uid} gid={gid} groups={} caps={:#x} umask={:04o} {nnp} seccomp={sc} · NOT: {not}",
+        "vantage: as {unit} (pid {guest_pid}): ns=all uid={uid} gid={gid} groups={} caps={:#x} umask={:04o} {nnp} seccomp={sc}{root} · NOT: {not}",
         gl.join(","),
         st.cap_eff,
         st.umask
     )
+}
+
+/// Is the process behind this `/proc/<pid>/status` still the service's main
+/// process (`NSpid`'s last field = its pid in the guest)? A restart between
+/// the lookup and opening the namespaces would otherwise hand us a stranger.
+pub fn still_main(status: &str, guest_pid: u32) -> bool {
+    proc_status::parse(status).nspid.last() == Some(&guest_pid)
 }
 
 fn cstr(s: &str) -> CString {
@@ -103,12 +120,15 @@ const CAP_V3: u32 = 0x2008_0522;
 /// Returns the program's exit code. On return the calling process has joined
 /// the service's namespaces, cgroup and supplementary groups: the caller
 /// must do nothing but exit with the returned code.
+#[allow(clippy::too_many_arguments)]
 pub fn run_as_service(
     h: &dyn Host,
     guest: &str,
     unit: &str,
     program: &str,
     args: &[String],
+    headers: &[String],
+    header_files: &[(String, String)],
 ) -> i32 {
     let tool = crate::app::EXIT_TOOL;
     let unit = crate::machine::unit_name(unit);
@@ -159,19 +179,25 @@ pub fn run_as_service(
             return tool;
         }
     };
-    let report = report_line(
-        &unit,
-        guest_pid,
-        uid,
-        gid,
-        &groups,
-        &st,
-        &filters_count,
-        nnp_added,
-    );
+    let report = |root_own| {
+        report_line(
+            &unit,
+            guest_pid,
+            uid,
+            gid,
+            &groups,
+            &st,
+            &filters_count,
+            nnp_added,
+            root_own,
+        )
+    };
+    let (report_same_root, report_own_root) = (report(false), report(true));
+    let wants_rc = !headers.is_empty() || !header_files.is_empty();
 
     // Everything the child needs is prepared before any namespace switch:
-    // no heap allocation between fork and execve.
+    // no heap allocation between fork and execve — except for the curlrc
+    // when headers are asked for (the child is single-threaded).
     let prog = crate::guest_run::resolve_program(program);
     let mut argv_s = vec![prog.clone()];
     argv_s.extend(args.iter().cloned());
@@ -192,6 +218,29 @@ pub fn run_as_service(
                 eprintln!("vantage: /proc/{host_pid}/ns/{n}: {e}");
                 return tool;
             }
+        }
+    }
+    // The service's root directory, taken before any namespace switch
+    // (like nsenter --root): the child chroots into it.
+    let root_path = cstr(&format!("/proc/{host_pid}/root"));
+    let rootfd = unsafe {
+        libc::open(
+            root_path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if rootfd < 0 {
+        let e = std::io::Error::last_os_error();
+        eprintln!("vantage: /proc/{host_pid}/root: {e}");
+        return tool;
+    }
+    // Everything is opened: is it still the same process? A restart in
+    // between would have us join a stranger's (or no) namespaces.
+    match h.read(&format!("/proc/{host_pid}/status")) {
+        Ok(s) if still_main(&s, guest_pid) => {}
+        _ => {
+            eprintln!("vantage: {unit} restarted during setup, try again");
+            return tool;
         }
     }
     if let Err(e) = std::fs::write(&cg_path, format!("{}\n", std::process::id())) {
@@ -232,7 +281,38 @@ pub fn run_as_service(
                 128 + libc::WTERMSIG(s)
             };
         }
-        // Child: now inside the pid namespace.
+        // Child: now inside the pid namespace. setns(mnt) put root and cwd
+        // at the root of the mount namespace; the service may live below it
+        // (RootDirectory=). Compare, then chroot into the service's root
+        // while still privileged.
+        let mut ns_root: libc::stat = std::mem::zeroed();
+        let mut svc_root: libc::stat = std::mem::zeroed();
+        if libc::stat(c"/".as_ptr(), &mut ns_root) != 0 {
+            fail(
+                "stat / of the mount namespace",
+                std::io::Error::last_os_error(),
+            );
+        }
+        if libc::fstat(rootfd, &mut svc_root) != 0 {
+            fail("fstat the service's root", std::io::Error::last_os_error());
+        }
+        let root_own = (ns_root.st_dev, ns_root.st_ino) != (svc_root.st_dev, svc_root.st_ino);
+        if libc::fchdir(rootfd) != 0 {
+            fail(
+                "fchdir to the service's root",
+                std::io::Error::last_os_error(),
+            );
+        }
+        if libc::chroot(c".".as_ptr()) != 0 {
+            fail(
+                "chroot into the service's root",
+                std::io::Error::last_os_error(),
+            );
+        }
+        if libc::chdir(c"/".as_ptr()) != 0 {
+            fail("chdir /", std::io::Error::last_os_error());
+        }
+        libc::close(rootfd);
         for cap in 0..=last_cap {
             if (st.cap_bnd >> cap) & 1 == 0
                 && libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) != 0
@@ -290,15 +370,42 @@ pub fn run_as_service(
         if libc::signal(libc::SIGPIPE, libc::SIG_DFL) == libc::SIG_ERR {
             fail("signal SIGPIPE", std::io::Error::last_os_error());
         }
-        if libc::chdir(c"/".as_ptr()) != 0 {
-            fail("chdir /", std::io::Error::last_os_error());
-        }
-        eprintln!("{report}");
+        eprintln!(
+            "{}",
+            if root_own {
+                &report_own_root
+            } else {
+                &report_same_root
+            }
+        );
+        // Headers: read the files HERE — as the service user, in its mount
+        // namespace and root — into a curlrc memfd, and put -K in front of
+        // curl's own arguments. The child is single-threaded, so allocating
+        // is safe; seccomp is not loaded yet, so memfd_create is allowed.
+        let rc_argv: Vec<CString>;
+        let mut rc_argv_p: Vec<*const libc::c_char> = Vec::new();
+        let argv_final = if wants_rc {
+            let fd = match crate::exec::curlrc_memfd(headers, header_files) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    eprintln!("vantage: {e}");
+                    libc::_exit(crate::app::EXIT_TOOL);
+                }
+            };
+            let mut v = vec![prog.clone(), "-K".into(), format!("/proc/self/fd/{fd}")];
+            v.extend(args.iter().cloned());
+            rc_argv = v.iter().map(|s| cstr(s)).collect();
+            rc_argv_p.extend(rc_argv.iter().map(|c| c.as_ptr()));
+            rc_argv_p.push(std::ptr::null());
+            rc_argv_p.as_ptr()
+        } else {
+            argv_p.as_ptr()
+        };
         if let Err(e) = seccomp::load_filters(&filters) {
             eprintln!("vantage: {e}");
             libc::_exit(crate::app::EXIT_TOOL);
         }
-        libc::execve(prog_c.as_ptr(), argv_p.as_ptr(), envp.as_ptr());
+        libc::execve(prog_c.as_ptr(), argv_final, envp.as_ptr());
         let e = std::io::Error::last_os_error();
         eprintln!("vantage: cannot run {prog}: {e}");
         libc::_exit(if e.raw_os_error() == Some(libc::ENOENT) {
@@ -336,7 +443,17 @@ mod tests {
             inner: vec![9000, 950],
             unmapped: vec![109000],
         };
-        let l = report_line("sftpgo.service", 284, 950, 9000, &g, &st, &Ok(36), false);
+        let l = report_line(
+            "sftpgo.service",
+            284,
+            950,
+            9000,
+            &g,
+            &st,
+            &Ok(36),
+            false,
+            false,
+        );
         assert_eq!(
             l,
             "vantage: as sftpgo.service (pid 284): ns=all uid=950 gid=9000 \
@@ -354,6 +471,7 @@ mod tests {
             &st,
             &Err("PTRACE_SEIZE: Operation not permitted".into()),
             true,
+            false,
         );
         assert!(l.contains("nnp(added)"), "{l}");
         assert!(
@@ -376,8 +494,34 @@ mod tests {
             &none,
             &Ok(0),
             false,
+            false,
         );
         assert!(l.contains("umask=0022 no-nnp seccomp=none"), "{l}");
         assert!(l.ends_with("NOT: lsm,rlimits"), "{l}");
+        assert!(!l.contains("root="), "{l}");
+    }
+
+    #[test]
+    fn own_root_directory_is_named() {
+        let st = Status {
+            seccomp_mode: 0,
+            ..Default::default()
+        };
+        let g = Groups {
+            inner: vec![],
+            unmapped: vec![],
+        };
+        let l = report_line("c.service", 7, 1, 1, &g, &st, &Ok(0), false, true);
+        assert!(
+            l.contains("seccomp=none root=own · NOT: lsm,rlimits"),
+            "{l}"
+        );
+    }
+
+    #[test]
+    fn restarted_service_is_noticed_through_nspid() {
+        assert!(still_main("Name:\tx\nNSpid:\t2001\t251\n", 251));
+        assert!(!still_main("Name:\tx\nNSpid:\t2001\t252\n", 251));
+        assert!(!still_main("Name:\tx\n", 251));
     }
 }
