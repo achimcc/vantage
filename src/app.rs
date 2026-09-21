@@ -46,10 +46,17 @@ fn dispatch(cmd: Cmd) -> i32 {
                 2
             }
         },
-        _ => {
-            eprintln!("vantage: not implemented yet");
-            EXIT_TOOL
-        }
+        Cmd::Where { guest } => match crate::where_cmd::run(&crate::host::Real, &guest) {
+            Ok(t) => {
+                print!("{t}");
+                0
+            }
+            Err(e) => {
+                eprintln!("vantage: {e}");
+                EXIT_TOOL
+            }
+        },
+        Cmd::Help | Cmd::Version => unreachable!("handled in main"),
     }
 }
 
