@@ -98,10 +98,13 @@ over every child namespace only until it joins `user`:
   not set it itself, `nnp(added)`);
 - the **root directory** — `/proc/<pid>/root` is opened before the namespace
   switch and the child `chroot`s into it, so a unit with `RootDirectory=`
-  (NixOS `confinement.enable`) sees its own root, not the guest's. The
-  report line says `root=own` when that root differs from the root of the
-  mount namespace. Inside such a root only what the unit mounts exists: the
-  program has to be there too, or it is 127;
+  (NixOS `confinement.enable`) sees its own root, not the guest's. The report
+  line says `root=own` when that root differs from the guest's own root —
+  compared on the host, before any `setns`, since after joining the service's
+  own mount namespace `/` is already the confined root and the comparison
+  would trivially agree with itself. Inside such a root only what the unit
+  mounts exists: the program has to be there too, or it is 127 (the message
+  says so, when `root=own` applies);
 - **umask** (file-mode measurements depend on it);
 - **seccomp filters**, copied from the live process via `ptrace` and loaded
   back in the same order (index 0 is the most recently installed filter, so

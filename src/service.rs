@@ -15,8 +15,11 @@
 //! * The root directory is reproduced: `/proc/<pid>/root` is opened before
 //!   the namespace switch and the child chroots into it, so a unit with
 //!   `RootDirectory=` (e.g. `confinement.enable`) sees its own root. The
-//!   report line says `root=own` when that root differs from the root of
-//!   the mount namespace.
+//!   report line says `root=own` when that root differs from the GUEST's
+//!   own root (`/proc/<leader pid>/root`) — compared on the HOST, before any
+//!   `setns`. Comparing after joining the service's mount namespace does not
+//!   work: for a confined unit, systemd has already pivoted that namespace's
+//!   `/` onto the confined root, so it is trivially equal to itself.
 //! * With --header/--header-file the child itself — as the service user, in
 //!   the service's mount namespace and root — reads the files and hands curl
 //!   a curlrc in a memfd; there is no re-exec of vantage on this path.
@@ -92,6 +95,26 @@ pub fn still_main(status: &str, guest_pid: u32) -> bool {
     proc_status::parse(status).nspid.last() == Some(&guest_pid)
 }
 
+/// dev/inode of the directory `/proc/<pid>/root` resolves to, from the
+/// host's own mount namespace — read before any `setns`.
+fn stat_root(pid: u32) -> Result<(libc::dev_t, libc::ino_t), std::io::Error> {
+    let path = cstr(&format!("/proc/{pid}/root"));
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(path.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((st.st_dev, st.st_ino))
+}
+
+/// A unit with `RootDirectory=` has its own root: a plain dev/inode
+/// comparison, done on the host before any namespace is joined. Comparing
+/// *inside* the service's mount namespace does not work — for a confined
+/// unit systemd already pivots that namespace's `/` onto the confined root,
+/// so it is trivially equal to itself.
+fn roots_differ(service: (libc::dev_t, libc::ino_t), guest: (libc::dev_t, libc::ino_t)) -> bool {
+    service != guest
+}
+
 fn cstr(s: &str) -> CString {
     CString::new(s).expect("no NUL in arguments")
 }
@@ -139,6 +162,26 @@ pub fn run_as_service(
             return tool;
         }
     };
+    let leader_pid = match crate::machine::leader(h, guest) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("vantage: {e}");
+            return tool;
+        }
+    };
+    // root=own: a plain host-side comparison against the GUEST's root, done
+    // before any setns — see `roots_differ`.
+    let root_own = match (stat_root(host_pid), stat_root(leader_pid)) {
+        (Ok(svc), Ok(g)) => roots_differ(svc, g),
+        (Err(e), _) => {
+            eprintln!("vantage: stat /proc/{host_pid}/root: {e}");
+            return tool;
+        }
+        (_, Err(e)) => {
+            eprintln!("vantage: stat /proc/{leader_pid}/root: {e}");
+            return tool;
+        }
+    };
     let read = |p: String| h.read(&p);
     let (st, uid_map, gid_map, cg) = match (
         read(format!("/proc/{host_pid}/status")),
@@ -179,20 +222,17 @@ pub fn run_as_service(
             return tool;
         }
     };
-    let report = |root_own| {
-        report_line(
-            &unit,
-            guest_pid,
-            uid,
-            gid,
-            &groups,
-            &st,
-            &filters_count,
-            nnp_added,
-            root_own,
-        )
-    };
-    let (report_same_root, report_own_root) = (report(false), report(true));
+    let report = report_line(
+        &unit,
+        guest_pid,
+        uid,
+        gid,
+        &groups,
+        &st,
+        &filters_count,
+        nnp_added,
+        root_own,
+    );
     let wants_rc = !headers.is_empty() || !header_files.is_empty();
 
     // Everything the child needs is prepared before any namespace switch:
@@ -281,22 +321,10 @@ pub fn run_as_service(
                 128 + libc::WTERMSIG(s)
             };
         }
-        // Child: now inside the pid namespace. setns(mnt) put root and cwd
-        // at the root of the mount namespace; the service may live below it
-        // (RootDirectory=). Compare, then chroot into the service's root
+        // Child: now inside the pid namespace. `root_own` was decided on the
+        // host, before this setns — see the comment at `roots_differ`. What
+        // is left here is only the mechanics: chroot into the service's root
         // while still privileged.
-        let mut ns_root: libc::stat = std::mem::zeroed();
-        let mut svc_root: libc::stat = std::mem::zeroed();
-        if libc::stat(c"/".as_ptr(), &mut ns_root) != 0 {
-            fail(
-                "stat / of the mount namespace",
-                std::io::Error::last_os_error(),
-            );
-        }
-        if libc::fstat(rootfd, &mut svc_root) != 0 {
-            fail("fstat the service's root", std::io::Error::last_os_error());
-        }
-        let root_own = (ns_root.st_dev, ns_root.st_ino) != (svc_root.st_dev, svc_root.st_ino);
         if libc::fchdir(rootfd) != 0 {
             fail(
                 "fchdir to the service's root",
@@ -370,14 +398,7 @@ pub fn run_as_service(
         if libc::signal(libc::SIGPIPE, libc::SIG_DFL) == libc::SIG_ERR {
             fail("signal SIGPIPE", std::io::Error::last_os_error());
         }
-        eprintln!(
-            "{}",
-            if root_own {
-                &report_own_root
-            } else {
-                &report_same_root
-            }
-        );
+        eprintln!("{report}");
         // Headers: read the files HERE — as the service user, in its mount
         // namespace and root — into a curlrc memfd, and put -K in front of
         // curl's own arguments. The child is single-threaded, so allocating
@@ -407,12 +428,14 @@ pub fn run_as_service(
         }
         libc::execve(prog_c.as_ptr(), argv_final, envp.as_ptr());
         let e = std::io::Error::last_os_error();
-        eprintln!("vantage: cannot run {prog}: {e}");
-        libc::_exit(if e.raw_os_error() == Some(libc::ENOENT) {
-            127
+        let is_enoent = e.raw_os_error() == Some(libc::ENOENT);
+        let hint = if is_enoent && root_own {
+            " (the service has its own root directory — only programs inside it exist there)"
         } else {
-            126
-        });
+            ""
+        };
+        eprintln!("vantage: cannot run {prog}: {e}{hint}");
+        libc::_exit(if is_enoent { 127 } else { 126 });
     }
 }
 
@@ -523,5 +546,15 @@ mod tests {
         assert!(still_main("Name:\tx\nNSpid:\t2001\t251\n", 251));
         assert!(!still_main("Name:\tx\nNSpid:\t2001\t252\n", 251));
         assert!(!still_main("Name:\tx\n", 251));
+    }
+
+    #[test]
+    fn roots_differ_is_a_plain_dev_ino_comparison() {
+        // Same device, same inode — the common case (no RootDirectory=).
+        assert!(!roots_differ((8, 100), (8, 100)));
+        // Same device, own inode — RootDirectory= below the guest's root.
+        assert!(roots_differ((8, 200), (8, 100)));
+        // A confined unit can also sit on its own tmpfs/overlay device.
+        assert!(roots_differ((9, 1), (8, 100)));
     }
 }
