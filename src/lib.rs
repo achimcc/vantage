@@ -11,5 +11,6 @@ pub mod probe;
 pub mod proc_status;
 pub mod seccomp;
 pub mod service;
+pub mod text;
 pub mod where_cmd;
 // (Further modules are added by the following tasks here.)

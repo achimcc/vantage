@@ -95,7 +95,7 @@ pub fn addresses(h: &dyn Host, guest: &str) -> Result<Vec<IpAddr>, String> {
     if o.code != 0 {
         return Err(format!(
             "machined has no addresses for '{guest}': {}",
-            o.stderr.trim()
+            crate::text::visible(o.stderr.trim())
         ));
     }
     parse_addresses(&o.stdout)

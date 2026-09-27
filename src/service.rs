@@ -291,6 +291,18 @@ pub fn run_as_service(
     // the calls; vantage is single-threaded, so fork() leaves no lock held.
     unsafe {
         use std::os::fd::AsRawFd;
+        // NOT DUMPABLE BEFORE THE FIRST setns (audit 3 of the homeserver,
+        // B82). From the fork until `setresuid` the child lives in the
+        // guest's pid and user namespaces with kuid 0; `setns(user)` does not
+        // reset dumpability, so CAP_SYS_PTRACE in the GUEST's user namespace
+        // -- which guest root holds -- was enough to PTRACE_SEIZE it or open
+        // its /proc/<pid>/fd (the operator's ssh channels). Not dumpable,
+        // ptrace needs CAP_SYS_PTRACE in the namespace mm->user_ns names: the
+        // host's. `execve` of the target resets it (runc's nsexec does the
+        // same). Set here, it covers the parent and is inherited by the child.
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+            fail("PR_SET_DUMPABLE 0", std::io::Error::last_os_error());
+        }
         if libc::setgroups(st.groups.len(), st.groups.as_ptr()) != 0 {
             fail("setgroups (host gids)", std::io::Error::last_os_error());
         }
@@ -444,6 +456,23 @@ mod tests {
     use super::*;
     const SONARR: &str = include_str!("../tests/fixtures/status-sonarr.txt");
     const SONARR_GID_MAP: &str = include_str!("../tests/fixtures/gid_map-sonarr.txt");
+
+    /// B82: the process stops being dumpable BEFORE it enters the first
+    /// namespace and before the fork -- the window guest root could ptrace
+    /// into. Entering namespaces needs root, so this guards the order in the
+    /// source; the hostile-guest VM test checks the behaviour.
+    #[test]
+    fn not_dumpable_before_the_first_setns_and_the_fork() {
+        let src = include_str!("service.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        let at = |needle: &str| {
+            code.find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing from service.rs"))
+        };
+        let dumpable = at("libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0)");
+        assert!(dumpable < at("libc::setns("), "PR_SET_DUMPABLE after setns");
+        assert!(dumpable < at("libc::fork()"), "PR_SET_DUMPABLE after fork");
+    }
 
     #[test]
     fn unmapped_groups_are_kept_apart() {

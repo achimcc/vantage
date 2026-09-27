@@ -144,6 +144,9 @@ pub fn source_ports(pid: u32, now: u64) -> (u16, u16) {
 
 /// The verdict line, and for `refused` curl's own first stderr line — it
 /// says whether it was a refusal or an unreachable host.
+///
+/// Both carry text from the SOURCE guest (the HTTP code curl wrote there, its
+/// stderr): every control character is made visible (B81).
 pub fn report_lines(head: &str, v: &Verdict, curl_stderr: &str) -> Vec<String> {
     let mut out = vec![format!("vantage: {head}: {}", v.text())];
     if matches!(v, Verdict::Refused) {
@@ -151,7 +154,7 @@ pub fn report_lines(head: &str, v: &Verdict, curl_stderr: &str) -> Vec<String> {
             out.push(format!("vantage: curl said: {l}"));
         }
     }
-    out
+    out.into_iter().map(|l| crate::text::visible(&l)).collect()
 }
 
 pub fn probe(h: &dyn Host, cfg: &Config, a: &ProbeArgs) -> i32 {
@@ -202,7 +205,7 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
     let (src, dst) = match (addr(&a.from), addr(&a.target)) {
         (Ok(s), Ok(d)) => (s, d),
         (Err(e), _) | (_, Err(e)) => {
-            eprintln!("vantage: {e}");
+            eprintln!("vantage: {}", crate::text::visible(&e));
             return 2;
         }
     };
@@ -216,7 +219,7 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
     let mut out = match run_curl(h, a, &url, sport) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("vantage: {e}");
+            eprintln!("vantage: {}", crate::text::visible(&e));
             return 2;
         }
     };
@@ -226,7 +229,7 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
         out = match run_curl(h, a, &url, sport) {
             Ok(o) => o,
             Err(e) => {
-                eprintln!("vantage: {e}");
+                eprintln!("vantage: {}", crate::text::visible(&e));
                 return 2;
             }
         };
@@ -236,7 +239,7 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
         0 | 7 | 28 | 35 | 52 | 56 => match parse_write_out(&out.stdout) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!("vantage: {e}");
+                eprintln!("vantage: {}", crate::text::visible(&e));
                 return 2;
             }
         },
@@ -254,17 +257,34 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
                     }
                     match h.cmd(
                         "journalctl",
-                        &["--no-pager", "-o", "cat", "--since", &since, "--grep", p],
+                        // Only the kernel's own lines: a guest writes to its
+                        // console, and that lands in the host journal too
+                        // (container@<g>.service, _TRANSPORT=stdout) -- a
+                        // forged drop line there must not count (audit 3,
+                        // A1-6). A match, not `-k`: that implies `-b`.
+                        &[
+                            "--no-pager",
+                            "-o",
+                            "cat",
+                            "--since",
+                            &since,
+                            "--grep",
+                            p,
+                            "_TRANSPORT=kernel",
+                        ],
                     ) {
                         Ok(j) if j.code == 0 || j.code == 1 => {
                             seen = j.stdout.lines().any(|l| matches(l, p, &dst, sport, a.port));
                         }
                         Ok(j) => {
-                            eprintln!("vantage: journalctl: {}", j.stderr.trim());
+                            eprintln!(
+                                "vantage: journalctl: {}",
+                                crate::text::visible(j.stderr.trim())
+                            );
                             return 2;
                         }
                         Err(e) => {
-                            eprintln!("vantage: {e}");
+                            eprintln!("vantage: {}", crate::text::visible(&e));
                             return 2;
                         }
                     }
@@ -290,7 +310,7 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
             v.exit_code()
         }
         Err(e) => {
-            eprintln!("vantage: {e}");
+            eprintln!("vantage: {}", crate::text::visible(&e));
             2
         }
     }
@@ -478,7 +498,7 @@ mod tests {
         let sport = 46001;
         let line = LINE.replace("SPT=46576", &format!("SPT={sport}"));
         let h = guests().on(&curl_cmd(sport), 28, "000 0.000000").on(
-            "journalctl --no-pager -o cat --since @999 --grep zonenkante-ungedeckt",
+            "journalctl --no-pager -o cat --since @999 --grep zonenkante-ungedeckt _TRANSPORT=kernel",
             0,
             &line,
         );
@@ -520,5 +540,24 @@ mod tests {
             "curl: (7) Failed to connect\n",
         );
         assert_eq!(probe_with_ports(&h, &cfg(), &args(), (46001, 46002)), 1);
+    }
+
+    /// B81: what the source guest wrote (its HTTP code, curl's stderr) never
+    /// reaches the terminal with a control character in it.
+    #[test]
+    fn guest_text_in_the_report_carries_no_control_byte() {
+        let v = Verdict::Refused;
+        let lines = report_lines(
+            "probe a -> b",
+            &v,
+            "curl: (7) \x1b]52;c;S0FOQVJJRQ==\x07\x1b[2J boom\n",
+        );
+        assert_eq!(lines.len(), 2);
+        for l in &lines {
+            assert!(!l.bytes().any(|b| b < 0x20 || b == 0x7f), "{l:?}");
+        }
+        assert!(lines[1].contains("\\x1b]52;"), "{:?}", lines[1]);
+        let answered = report_lines("probe a -> b", &Verdict::Answered("\x1b[2J200".into()), "");
+        assert!(!answered[0].contains('\x1b'), "{:?}", answered[0]);
     }
 }
