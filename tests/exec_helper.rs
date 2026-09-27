@@ -1,12 +1,25 @@
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+
+/// Writes an executable script from a CHILD process. Written from the test
+/// process itself, the write descriptor is open while a parallel test forks;
+/// that child holds it until its own exec, and executing the script then
+/// fails with ETXTBSY ("Text file busy") -- seen in the Nix build.
+fn script(p: &std::path::Path, body: &str) {
+    let mut c = Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(p)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
+    assert!(c.wait().unwrap().success());
+}
 
 fn fake_curl(dir: &std::path::Path) -> std::path::PathBuf {
     // Prints its argv, then the curlrc it was given with -K.
     let p = dir.join("curl");
-    std::fs::write(&p, "#!/bin/sh\necho \"ARGS:$*\"\ncat \"$2\"\n").unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script(&p, "#!/bin/sh\necho \"ARGS:$*\"\ncat \"$2\"\n");
     p
 }
 
@@ -68,12 +81,10 @@ fn missing_program_is_127_unreadable_file_is_125() {
 /// SigIgn of the shell that runs this script, as hex from /proc/$$/status.
 fn sigign_script(dir: &std::path::Path) -> std::path::PathBuf {
     let p = dir.join("sigign");
-    std::fs::write(
+    script(
         &p,
         "#!/bin/sh\nwhile read -r k v; do [ \"$k\" = SigIgn: ] && echo \"SIGIGN=$v\"; done < /proc/$$/status\nexit 0\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     p
 }
 
