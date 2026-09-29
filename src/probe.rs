@@ -126,6 +126,45 @@ pub fn matches(line: &str, prefix: &str, dst: &IpAddr, sport: u16, dport: u16) -
         && line.contains(&format!(" DPT={dport} "))
 }
 
+/// Die Drop-Zeile DIESER Probe in der Ausgabe von `journalctl -o json`
+/// (ein Objekt je Zeile). Gezaehlt wird nur ein Eintrag, dessen
+/// `_TRANSPORT` selbst `kernel` ist -- ein Feld, das journald setzt und
+/// kein Absender schreiben kann (Audit 3, A1-6/B107). Die Match-Angabe
+/// `_TRANSPORT=kernel` in der journalctl-Zeile bleibt, sie filtert schon auf
+/// dem Wirt; hier steht die zweite Haelfte: Faellt der Filter je weg (ein
+/// `-k`, eine umgestellte Zeile), zaehlt eine Konsolenzeile des Gastes
+/// (container@<g>.service, `_TRANSPORT=stdout`) trotzdem nicht.
+///
+/// `MESSAGE` ist bei Steuerzeichen oder ungueltigem UTF-8 ein Byte-Array
+/// (so schreibt es journalctl); eine Zeile, die kein JSON ist, zaehlt nicht.
+pub fn drop_seen_in(
+    journal_json: &str,
+    prefix: &str,
+    dst: &IpAddr,
+    sport: u16,
+    dport: u16,
+) -> bool {
+    journal_json.lines().any(|l| {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(l) else {
+            return false;
+        };
+        if v["_TRANSPORT"].as_str() != Some("kernel") {
+            return false;
+        }
+        let msg = match &v["MESSAGE"] {
+            serde_json::Value::String(m) => m.clone(),
+            serde_json::Value::Array(b) => String::from_utf8_lossy(
+                &b.iter()
+                    .filter_map(|x| x.as_u64().map(|x| x as u8))
+                    .collect::<Vec<u8>>(),
+            )
+            .into_owned(),
+            _ => return false,
+        };
+        matches(&msg, prefix, dst, sport, dport)
+    })
+}
+
 /// A source port in 40000..60000 that differs between parallel probes.
 pub fn source_port(pid: u32, now: u64) -> u16 {
     40000 + ((pid as u64).wrapping_mul(2654435761) ^ now) as u16 % 20000
@@ -195,6 +234,30 @@ fn run_curl(
 }
 
 pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, u16)) -> i32 {
+    match probe_lines(h, cfg, a, ports) {
+        Ok((code, lines)) => {
+            for l in lines {
+                println!("{l}");
+            }
+            code
+        }
+        Err(e) => {
+            eprintln!("vantage: {}", crate::text::visible(&e));
+            2
+        }
+    }
+}
+
+/// Die Probe ohne Ausgabe: (Exit-Code, Zeilen fuer stdout), oder der Text
+/// eines Werkzeugfehlers (Exit 2). Getrennt, damit Tests das URTEIL sehen und
+/// nicht nur den Exit-Code, den `dropped at zone edge` und `dropped
+/// elsewhere` teilen.
+pub fn probe_lines(
+    h: &dyn Host,
+    cfg: &Config,
+    a: &ProbeArgs,
+    ports: (u16, u16),
+) -> Result<(i32, Vec<String>), String> {
     let addr = |g: &str| -> Result<IpAddr, String> {
         let all = machine::addresses(h, g)?;
         machine::pick(&all, a.v6).ok_or(format!(
@@ -205,8 +268,7 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
     let (src, dst) = match (addr(&a.from), addr(&a.target)) {
         (Ok(s), Ok(d)) => (s, d),
         (Err(e), _) | (_, Err(e)) => {
-            eprintln!("vantage: {}", crate::text::visible(&e));
-            return 2;
+            return Err(e);
         }
     };
     let host = match dst {
@@ -219,8 +281,7 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
     let mut out = match run_curl(h, a, &url, sport) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("vantage: {}", crate::text::visible(&e));
-            return 2;
+            return Err(e);
         }
     };
     if out.code == 45 {
@@ -229,8 +290,7 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
         out = match run_curl(h, a, &url, sport) {
             Ok(o) => o,
             Err(e) => {
-                eprintln!("vantage: {}", crate::text::visible(&e));
-                return 2;
+                return Err(e);
             }
         };
     }
@@ -239,8 +299,7 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
         0 | 7 | 28 | 35 | 52 | 56 => match parse_write_out(&out.stdout) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!("vantage: {}", crate::text::visible(&e));
-                return 2;
+                return Err(e);
             }
         },
         _ => (String::new(), 0.0),
@@ -262,10 +321,15 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
                         // (container@<g>.service, _TRANSPORT=stdout) -- a
                         // forged drop line there must not count (audit 3,
                         // A1-6). A match, not `-k`: that implies `-b`.
+                        // JSON statt `cat`: `drop_seen_in` prueft das Feld
+                        // `_TRANSPORT` jedes Eintrags noch einmal selbst
+                        // (B107). `--all`, sonst ist eine lange MESSAGE null.
                         &[
                             "--no-pager",
                             "-o",
-                            "cat",
+                            "json",
+                            "--all",
+                            "--output-fields=MESSAGE,_TRANSPORT",
                             "--since",
                             &since,
                             "--grep",
@@ -274,18 +338,13 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
                         ],
                     ) {
                         Ok(j) if j.code == 0 || j.code == 1 => {
-                            seen = j.stdout.lines().any(|l| matches(l, p, &dst, sport, a.port));
+                            seen = drop_seen_in(&j.stdout, p, &dst, sport, a.port);
                         }
                         Ok(j) => {
-                            eprintln!(
-                                "vantage: journalctl: {}",
-                                crate::text::visible(j.stderr.trim())
-                            );
-                            return 2;
+                            return Err(format!("journalctl: {}", j.stderr.trim()));
                         }
                         Err(e) => {
-                            eprintln!("vantage: {}", crate::text::visible(&e));
-                            return 2;
+                            return Err(e);
                         }
                     }
                     if seen {
@@ -298,22 +357,12 @@ pub fn probe_with_ports(h: &dyn Host, cfg: &Config, a: &ProbeArgs, ports: (u16, 
     } else {
         None
     };
-    match verdict(out.code, &code, time_connect, drop_seen) {
-        Ok(v) => {
-            let head = format!(
-                "probe {} ({src}) -> {} ({dst}):{}{} sport {sport}",
-                a.from, a.target, a.port, a.path
-            );
-            for l in report_lines(&head, &v, &out.stderr) {
-                println!("{l}");
-            }
-            v.exit_code()
-        }
-        Err(e) => {
-            eprintln!("vantage: {}", crate::text::visible(&e));
-            2
-        }
-    }
+    let v = verdict(out.code, &code, time_connect, drop_seen)?;
+    let head = format!(
+        "probe {} ({src}) -> {} ({dst}):{}{} sport {sport}",
+        a.from, a.target, a.port, a.path
+    );
+    Ok((v.exit_code(), report_lines(&head, &v, &out.stderr)))
 }
 
 #[cfg(test)]
@@ -498,13 +547,108 @@ mod tests {
         let sport = 46001;
         let line = LINE.replace("SPT=46576", &format!("SPT={sport}"));
         let h = guests().on(&curl_cmd(sport), 28, "000 0.000000").on(
-            "journalctl --no-pager -o cat --since @999 --grep zonenkante-ungedeckt _TRANSPORT=kernel",
+            JOURNAL_CMD,
             0,
-            &line,
+            &kernel_entry(&line),
         );
-        assert_eq!(probe_with_ports(&h, &cfg(), &args(), (sport, 46002)), 1);
+        let (code, lines) = probe_lines(&h, &cfg(), &args(), (sport, 46002)).unwrap();
+        assert_eq!(code, 1);
+        assert!(lines[0].contains(": dropped at zone edge"), "{lines:?}");
         assert!(h.asked.borrow().iter().any(|q| q.starts_with("journalctl")));
     }
+    const JOURNAL_CMD: &str = "journalctl --no-pager -o json --all --output-fields=MESSAGE,_TRANSPORT --since @999 --grep zonenkante-ungedeckt _TRANSPORT=kernel";
+
+    /// Ein Eintrag, wie `journalctl -o json --output-fields=MESSAGE,_TRANSPORT`
+    /// ihn schreibt: die Felder, die journalctl immer mitgibt (Cursor,
+    /// Zeitstempel, Boot-ID, Sequenz), plus die zwei verlangten. Die Form ist
+    /// an der Workstation abgelesen (gestalt, 2026-09-29); die Werte sind
+    /// erfunden.
+    fn entry(transport: &str, message: &str) -> String {
+        serde_json::json!({
+            "__CURSOR": "s=0123456789abcdef0123456789abcdef;i=1a2b3c;b=fedcba9876543210fedcba9876543210;m=1234abcd;t=6401a2b3c4d5e;x=0123456789abcdef",
+            "__REALTIME_TIMESTAMP": "1790000000123456",
+            "__MONOTONIC_TIMESTAMP": "305419896",
+            "_BOOT_ID": "fedcba9876543210fedcba9876543210",
+            "__SEQNUM": "1715004",
+            "__SEQNUM_ID": "0123456789abcdef0123456789abcdef",
+            "_TRANSPORT": transport,
+            "MESSAGE": message,
+        })
+        .to_string()
+    }
+    fn kernel_entry(message: &str) -> String {
+        entry("kernel", message.trim_end())
+    }
+
+    /// B107: Eine Zeile, die ein Gast auf seine Konsole schreibt, landet im
+    /// Wirtsjournal mit `_TRANSPORT=stdout` (Unit container@<g>.service).
+    /// Wortgleich zur echten Drop-Zeile -- den Quellport kennt der Gast aus
+    /// curls argv -- darf sie trotzdem kein `dropped at zone edge` ergeben,
+    /// auch dann nicht, wenn sie den Filter der journalctl-Zeile passiert.
+    #[test]
+    fn a_console_line_from_the_guest_is_no_zone_edge_drop() {
+        let d = ip("10.0.10.10");
+        let forged = entry("stdout", LINE.trim_end());
+        assert!(!drop_seen_in(
+            &forged,
+            "zonenkante-ungedeckt",
+            &d,
+            46576,
+            47113
+        ));
+        for t in ["syslog", "journal", "audit", "driver"] {
+            let e = entry(t, LINE.trim_end());
+            assert!(
+                !drop_seen_in(&e, "zonenkante-ungedeckt", &d, 46576, 47113),
+                "{t}"
+            );
+        }
+        // Dieselbe Zeile vom Kernel zaehlt.
+        let both = format!("{forged}\n{}\n", kernel_entry(LINE));
+        assert!(drop_seen_in(
+            &both,
+            "zonenkante-ungedeckt",
+            &d,
+            46576,
+            47113
+        ));
+        // Ende zu Ende: nur die Konsolenzeile im Journal -> kein Kanten-Drop,
+        // also `dropped elsewhere` (drop_seen = false).
+        let sport = 46576;
+        let h = guests()
+            .on(&curl_cmd(sport), 28, "000 0.000000")
+            .on(JOURNAL_CMD, 0, &forged);
+        let (code, lines) = probe_lines(&h, &cfg(), &args(), (sport, 46002)).unwrap();
+        assert_eq!(code, 1);
+        assert!(lines[0].contains(": dropped elsewhere"), "{lines:?}");
+    }
+
+    #[test]
+    fn message_as_byte_array_and_junk_lines() {
+        let d = ip("10.0.10.10");
+        // journalctl schreibt MESSAGE als Zahlenfeld, sobald ein Steuerzeichen
+        // darin steht.
+        let bytes: Vec<u8> = format!("{}\x07", LINE.trim_end()).into_bytes();
+        let e = serde_json::json!({"_TRANSPORT": "kernel", "MESSAGE": bytes}).to_string();
+        assert!(drop_seen_in(&e, "zonenkante-ungedeckt", &d, 46576, 47113));
+        // Keine JSON-Zeile (etwa `-o cat`-Ausgabe): zaehlt nicht.
+        assert!(!drop_seen_in(
+            LINE,
+            "zonenkante-ungedeckt",
+            &d,
+            46576,
+            47113
+        ));
+        let null = serde_json::json!({"_TRANSPORT": "kernel", "MESSAGE": null}).to_string();
+        assert!(!drop_seen_in(
+            &null,
+            "zonenkante-ungedeckt",
+            &d,
+            46576,
+            47113
+        ));
+    }
+
     #[test]
     fn slow_service_is_answered_and_never_asks_the_journal() {
         let sport = 46001;

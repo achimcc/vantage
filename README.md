@@ -73,7 +73,7 @@ there is no re-exec: the forked child reads the files itself (see below).
 ```
 $ vantage run web --as-service sftpgo.service -- ls -la /uploads
 vantage: as sftpgo.service (pid 284): ns=all uid=950 gid=9000 groups=9000,950,+109000(unmapped) \
-  caps=0x400 umask=0002 nnp seccomp=36 · NOT: lsm,rlimits
+  caps=0x400 umask=0002 nnp seccomp=36 · NOT: lsm,rlimits,securebits,keyring,seccomp-flags
 ```
 
 Plain `run` puts the program inside the guest; `--as-service <unit>` puts it
@@ -109,7 +109,10 @@ over every child namespace only until it joins `user`:
 - **seccomp filters**, copied from the live process via `ptrace` and loaded
   back in the same order (index 0 is the most recently installed filter, so
   they load from the highest index down), as the very last step before
-  `execve`.
+  `execve`. The number read back has to equal `Seccomp_filters` in
+  `/proc/<pid>/status`; if it does not (more than 512 filters, or a filter
+  added in between), no filter is loaded and the report line says
+  `seccomp=?` and `NOT: …,seccomp (read N filters, the process has M …)`.
 
 With `--header`/`--header-file`, the forked child — already as the service
 user, in the service's mount namespace and root, before the seccomp filters
@@ -117,12 +120,25 @@ are loaded — reads the files, writes the curlrc into a memfd and execs curl
 with `-K /proc/self/fd/<n>`. So `--header-file` paths are the paths *the
 service* sees, and a file the service may not read is an error (125).
 
-If the service restarts while `vantage` sets up (its main pid no longer
-matches after the namespaces are opened), `vantage` stops with 125 and
-"try again" instead of joining a stranger.
+The target is held by a **pidfd** from the moment it is chosen. Before the
+first `setns`, `/proc/self/fdinfo/<pidfd>` has to show it still alive, with
+the guest pid the guest's systemd named and an `NSpid` as deep as the guest
+leader's; and the opened `pid` namespace descriptor has to be the leader's
+pid namespace. If the service restarts while `vantage` sets up, or the pid
+is not a process of that guest (a host process with the same number — for
+instance another `vantage` that has joined the service's cgroup), `vantage`
+stops with 125 instead of joining a stranger.
 
-Not reproduced, and said so on the report line after `NOT:`: **LSM labels**
-and **rlimits**. The service's own **environment is never copied** — it can
+Which process is the service is still the guest's word: MainPID comes from
+the guest's systemd and the candidates from a cgroup the guest controls. A
+compromised guest can have a harmless process of its own replicated —
+`--as-service` measures a guest's sandbox, it is not evidence *against* the
+guest.
+
+Not reproduced, and said so on the report line after `NOT:`: **LSM labels**,
+**rlimits**, **securebits**, the **keyring**, and — where filters were
+copied — the **flags** a seccomp filter was loaded with (`LOG`,
+`SPEC_ALLOW`, `NEW_LISTENER`). The service's own **environment is never copied** — it can
 carry secrets; the child gets only `PATH=/run/current-system/sw/bin`. While
 `vantage` reads the filters via `ptrace`, the service stands still —
 measured 174–524 µs, well under a millisecond.
@@ -163,6 +179,21 @@ drop_log_prefix = "guest-forward-drop"
 
 the log prefix of the host's forward-drop rule. Without the file, every
 timeout comes back as "timed out … zone edge vs. elsewhere unknown".
+
+Only a journal entry whose `_TRANSPORT` is `kernel` counts as the drop
+line: `journalctl` is asked with that match, and vantage checks the field of
+every entry it gets back (`-o json`) once more. A guest's console lands in
+the host journal too (`container@<g>.service`, `_TRANSPORT=stdout`), and the
+guest knows the source port from curl's argv — a forged line there is not a
+drop.
+
+**What `probe` does not prove.** curl runs in the *source* guest, through
+that guest's systemd; its exit code and `-w` line are the source guest's
+word. A compromised source can report `answered 200` for a path that is
+closed, or `refused` for one that is open. Only `dropped at zone edge` rests
+on the host (the kernel's own log line). To *prove* that a path is blocked
+against a hostile source, read the zone edge's counters on the host (e.g.
+groundtruth's), not a probe verdict.
 
 ### `where`
 
@@ -205,8 +236,12 @@ found in the guest's profile, **126** program not executable.
   `/nix/store`, and a `vantage` that runs from `/nix/store` (it refuses to
   otherwise). Without headers, and with `--as-service`, it does not.
 - Runs as **root on the host**.
-- `--as-service` does not reproduce **LSM labels** or **rlimits**; the
-  report line says so.
+- `--as-service` does not reproduce **LSM labels**, **rlimits**,
+  **securebits**, the **keyring** or **seccomp filter flags**; the report
+  line says so. Which process it replicates is the guest's choice (MainPID
+  from the guest's systemd).
+- `probe`'s verdict belongs to the source guest, except `dropped at zone
+  edge` (a kernel log line on the host) — see above.
 - While `vantage` reads a service's seccomp filters via `ptrace`, that
   service is paused — measured 174–524 µs.
 

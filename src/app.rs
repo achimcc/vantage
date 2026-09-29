@@ -16,6 +16,9 @@ vantage — measure inside a systemd-nspawn guest from the right vantage point
 Runs on the host as root. Exit: the program's code; 125 tool error, 127 not in
 the guest's profile (systemd's 203/EXEC), 126 not executable (only where vantage
 execs itself: --as-service, __exec). probe: 0 answered, 1 finding, 2 tool error.
+probe's verdict is the SOURCE guest's word (its curl), except 'dropped at zone
+edge' (the kernel's log line on the host): against a compromised source it
+proves nothing -- read the zone edge's counters on the host for that.
 ";
 
 pub fn main(argv: &[String]) -> i32 {

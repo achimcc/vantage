@@ -70,6 +70,24 @@ pub fn read_filters(pid: i32) -> Result<(Vec<Filter>, Duration), String> {
     }
 }
 
+/// Die gelesenen Filter gegen `Seccomp_filters` aus `/proc/<pid>/status`
+/// (Audit 3, A1-7/B108). Gelesen wird hoechstens 512 Stueck, und der Dienst
+/// kann zwischen dem Lesen von status und dem ptrace einen Filter
+/// nachladen: Stimmt die Zahl nicht, ist die Nachbildung nicht die des
+/// Dienstes -- dann wird GAR KEIN Filter geladen und die Berichtszeile nennt
+/// `seccomp (…)` unter `NOT:`, statt eine Teilmenge als `seccomp=<n>`
+/// auszugeben.
+pub fn checked(read: Result<Vec<Filter>, String>, reported: u32) -> Result<Vec<Filter>, String> {
+    let f = read?;
+    if f.len() as u64 != reported as u64 {
+        return Err(format!(
+            "read {} filters, the process has {reported} (Seccomp_filters)",
+            f.len()
+        ));
+    }
+    Ok(f)
+}
+
 pub fn load_filters(filters: &[Filter]) -> Result<(), String> {
     for (i, f) in filters.iter().enumerate().rev() {
         let prog = libc::sock_fprog {
@@ -136,6 +154,25 @@ mod tests {
             libc::waitpid(pid, &mut st, 0);
             libc::WEXITSTATUS(st)
         }
+    }
+
+    /// B108: 36 Filter meldet der Kernel fuer sonarr (aufgezeichnetes
+    /// status), 35 kamen ueber ptrace zurueck -- keine Nachbildung.
+    #[test]
+    fn filter_count_must_match_the_status_line() {
+        let st = crate::proc_status::parse(include_str!("../tests/fixtures/status-sonarr.txt"));
+        assert_eq!(st.seccomp_filters, 36);
+        let n = |k: usize| Ok((0..k).map(|_| deny_getppid()).collect::<Vec<_>>());
+        assert_eq!(checked(n(36), st.seccomp_filters).unwrap().len(), 36);
+        let e = checked(n(35), st.seccomp_filters).err().unwrap();
+        assert_eq!(e, "read 35 filters, the process has 36 (Seccomp_filters)");
+        // 512 ist die Lesegrenze: mehr als das faellt hier auf.
+        assert!(checked(n(512), 600).is_err());
+        // Ein Lesefehler bleibt der Lesefehler.
+        assert_eq!(
+            checked(Err("PTRACE_SEIZE: x".into()), 36).err().unwrap(),
+            "PTRACE_SEIZE: x"
+        );
     }
 
     #[test]

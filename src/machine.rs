@@ -118,9 +118,21 @@ pub fn service_host_pid(h: &dyn Host, guest: &str, unit: &str) -> Result<(u32, u
             "{unit} in {guest} has no running main process (MainPID=0)"
         ));
     }
+    // Die Tiefe des PID-Namensraums des Gastes: so viele Felder hat `NSpid`
+    // seines Leaders (Wirt, Gast). Ein Kandidat muss genauso tief liegen --
+    // sonst besteht ein WIRTSprozess, dessen Wirts-PID zufaellig gleich der
+    // MainPID ist (`NSpid:\t4242`), und genau so einer sitzt waehrend eines
+    // zweiten `vantage run --as-service` in der cgroup des Dienstes: der
+    // Elternprozess von vantage selbst (Audit 3, A1-7/B108). Dass es
+    // derselbe Namensraum ist und nicht nur dieselbe Tiefe, prueft
+    // `run_as_service` am geoeffneten Namensraum-FD.
+    let depth = proc_status::parse(&h.read(&format!("/proc/{l}/status"))?)
+        .nspid
+        .len();
     for pid in procs.split_whitespace() {
         if let Ok(st) = h.read(&format!("/proc/{pid}/status")) {
-            if proc_status::parse(&st).nspid.last() == Some(&main) {
+            let ns = proc_status::parse(&st).nspid;
+            if ns.len() == depth && ns.last() == Some(&main) {
                 return Ok((pid.parse().unwrap(), main));
             }
         }
@@ -180,6 +192,7 @@ mod tests {
                 "/proc/1000/cgroup",
                 "0::/machine.slice/container@media-01.service/payload/init.scope\n",
             )
+            .file("/proc/1000/status", "Name:\tsystemd\nNSpid:\t1000\t1\n")
             .file(
                 &format!("{payload}/system.slice/sonarr.service/cgroup.procs"),
                 "2000\n2001\n",
@@ -196,6 +209,43 @@ mod tests {
             (2001, 251)
         );
     }
+    /// B108: In der cgroup des Dienstes sitzt ein WIRTSprozess (der
+    /// Elternprozess eines zweiten `vantage run --as-service`, der sich
+    /// dorthin geschrieben hat). Seine Wirts-PID ist gleich der MainPID, die
+    /// der Gast meldet; `NSpid` hat bei ihm nur ein Feld -- so schreibt der
+    /// Kernel es fuer einen Prozess im Wurzel-Namensraum. Er darf nicht
+    /// gewaehlt werden, auch nicht, wenn er vor dem echten Dienst steht.
+    #[test]
+    fn a_host_process_with_the_same_number_is_not_the_service() {
+        use crate::host::fake::Fake;
+        let payload = "/sys/fs/cgroup/machine.slice/container@media-01.service/payload";
+        let h = |procs: &str| {
+            Fake::default()
+                .on("machinectl show media-01 -p Leader", 0, "Leader=1000\n")
+                .file(
+                    "/proc/1000/cgroup",
+                    "0::/machine.slice/container@media-01.service/payload/init.scope\n",
+                )
+                .file("/proc/1000/status", "Name:\tsystemd\nNSpid:\t1000\t1\n")
+                .file(
+                    &format!("{payload}/system.slice/sonarr.service/cgroup.procs"),
+                    procs,
+                )
+                .on(
+                    "systemctl -M media-01 show -p MainPID sonarr.service",
+                    0,
+                    "MainPID=251\n",
+                )
+                .file("/proc/251/status", "Name:\tvantage\nNSpid:\t251\n")
+                .file("/proc/2001/status", "Name:\tSonarr\nNSpid:\t2001\t251\n")
+        };
+        assert_eq!(
+            service_host_pid(&h("251\n2001\n"), "media-01", "sonarr").unwrap(),
+            (2001, 251)
+        );
+        let e = service_host_pid(&h("251\n"), "media-01", "sonarr").unwrap_err();
+        assert!(e.contains("not found"), "{e}");
+    }
     #[test]
     fn service_without_main_pid_is_an_error() {
         use crate::host::fake::Fake;
@@ -206,6 +256,7 @@ mod tests {
                 "/proc/1/cgroup",
                 "0::/machine.slice/container@m.service/payload/init.scope\n",
             )
+            .file("/proc/1/status", "NSpid:\t1\t1\n")
             .file(
                 &format!("{payload}/system.slice/x.service/cgroup.procs"),
                 "",
