@@ -16,5 +16,13 @@ toml = "0.8"
 [dev-dependencies]
 tempfile = "3"
 
+[lints.rust]
+# `unsafe` is denied crate-wide. vantage needs it for the syscalls std does not
+# wrap (setns, ptrace, seccomp, pidfd_open, capset, memfd_create): each
+# function that does carries `#[allow(unsafe_code)]`, each block a SAFETY
+# comment.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
 [profile.release]
 lto = true

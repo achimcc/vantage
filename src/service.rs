@@ -120,6 +120,7 @@ pub fn still_main(fdinfo: &str, host_pid: u32, guest_pid: u32, depth: usize) -> 
 }
 
 /// pidfd_open(2): haelt den Prozess fest, nicht die Nummer.
+#[allow(unsafe_code)]
 fn pidfd_open(pid: u32) -> Result<std::os::fd::OwnedFd, std::io::Error> {
     use std::os::fd::FromRawFd;
     // SAFETY: Systemaufruf ohne Zeiger; ein Rueckgabewert >= 0 ist ein
@@ -129,6 +130,8 @@ fn pidfd_open(pid: u32) -> Result<std::os::fd::OwnedFd, std::io::Error> {
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: `fd` ist >= 0 (oben geprueft) und frisch von pidfd_open, siehe
+    // oben: Dieses OwnedFd ist sein einziger Besitzer.
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
 }
 
@@ -143,9 +146,14 @@ pub fn same_ns(fd: &std::fs::File, path: &str) -> Result<bool, std::io::Error> {
 
 /// dev/inode of the directory `/proc/<pid>/root` resolves to, from the
 /// host's own mount namespace — read before any `setns`.
+#[allow(unsafe_code)]
 fn stat_root(pid: u32) -> Result<(libc::dev_t, libc::ino_t), std::io::Error> {
     let path = cstr(&format!("/proc/{pid}/root"));
+    // SAFETY: `libc::stat` is a plain C struct of integers; all-zero is a
+    // valid value for it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a NUL-terminated CString and `st` a live, writable
+    // `libc::stat`; both outlive the call.
     if unsafe { libc::stat(path.as_ptr(), &mut st) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -167,8 +175,12 @@ fn cstr(s: &str) -> CString {
 
 /// `err` is captured by the caller right after the failing call, before
 /// anything (e.g. `format!`) can clobber errno.
+#[allow(unsafe_code)]
 fn fail(what: &str, err: std::io::Error) -> ! {
     eprintln!("vantage: {what}: {err}");
+    // SAFETY: _exit(2) takes no pointer and never returns. Skipping
+    // destructors and atexit handlers is intended: `fail` is also called in
+    // the forked child, where they are the parent's.
     unsafe { libc::_exit(crate::app::EXIT_TOOL) }
 }
 
@@ -190,6 +202,7 @@ const CAP_V3: u32 = 0x2008_0522;
 /// the service's namespaces, cgroup and supplementary groups: the caller
 /// must do nothing but exit with the returned code.
 #[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
 pub fn run_as_service(
     h: &dyn Host,
     guest: &str,
@@ -329,6 +342,7 @@ pub fn run_as_service(
     // The service's root directory, taken before any namespace switch
     // (like nsenter --root): the child chroots into it.
     let root_path = cstr(&format!("/proc/{host_pid}/root"));
+    // SAFETY: `root_path` is a NUL-terminated CString that outlives the call.
     let rootfd = unsafe {
         libc::open(
             root_path.as_ptr(),
@@ -375,6 +389,14 @@ pub fn run_as_service(
     }
     // SAFETY: plain syscalls on prepared, NUL-terminated buffers that outlive
     // the calls; vantage is single-threaded, so fork() leaves no lock held.
+    // In detail: the argv/envp pointer arrays end in a null pointer and point
+    // into CStrings (`argv_c`, `rc_argv`, `env_c`, `prog_c`) that live until
+    // execve or _exit; setgroups reads `st.groups.len()` gids from that very
+    // Vec; setns gets descriptors of the still-open files in `fds`; `rootfd`
+    // is the open O_PATH descriptor from above and is closed once, in the
+    // child, after its last use;
+    // capset reads a `repr(C)` header and the two data elements that
+    // _LINUX_CAPABILITY_VERSION_3 expects; `&mut s` is a live local int.
     unsafe {
         use std::os::fd::AsRawFd;
         // NOT DUMPABLE BEFORE THE FIRST setns (audit 3 of the homeserver,

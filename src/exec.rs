@@ -16,6 +16,7 @@ use std::os::unix::process::CommandExt;
 /// memfd WITHOUT close-on-exec, so curl can read it as `/proc/self/fd/<n>`.
 /// Returns the descriptor. Errors name header names and paths, never values.
 /// Used by `__exec` and by the forked child of `--as-service`.
+#[allow(unsafe_code)]
 pub fn curlrc_memfd(headers: &[String], header_files: &[(String, String)]) -> Result<i32, String> {
     let mut all = headers.to_vec();
     for (name, path) in header_files {
@@ -26,10 +27,14 @@ pub fn curlrc_memfd(headers: &[String], header_files: &[(String, String)]) -> Re
     let rc = curlrc::render(&all)?;
     let name = CString::new("vantage-curlrc").unwrap();
     // No MFD_CLOEXEC: curl must inherit the descriptor across exec.
+    // SAFETY: `name` is a NUL-terminated CString that outlives the call.
     let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
     if fd < 0 {
         return Err(format!("memfd_create: {}", std::io::Error::last_os_error()));
     }
+    // SAFETY: `fd` is >= 0 (checked above), fresh from memfd_create and
+    // owned by nothing else; this File is its only owner until into_raw_fd
+    // below hands it on.
     let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
     if let Err(e) = f.write_all(rc.as_bytes()) {
         return Err(format!("writing the curlrc: {e}"));
@@ -68,6 +73,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    #[allow(unsafe_code)]
     fn curlrc_lands_in_an_inheritable_memfd() {
         let d = tempfile::tempdir().unwrap();
         let key = d.path().join("key");
@@ -80,9 +86,12 @@ mod tests {
             &[("X-Api-Key".to_string(), key.display().to_string())],
         )
         .unwrap();
+        // SAFETY: F_GETFD takes no pointer; `fd` is the open memfd.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         assert_eq!(flags & libc::FD_CLOEXEC, 0, "curl must inherit the fd");
         let rc = std::fs::read_to_string(format!("/proc/self/fd/{fd}")).unwrap();
+        // SAFETY: `fd` came out of curlrc_memfd as a raw descriptor this test
+        // owns; it is closed once and not used afterwards.
         unsafe { libc::close(fd) };
         assert_eq!(
             rc,

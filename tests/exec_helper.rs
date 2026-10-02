@@ -99,6 +99,7 @@ fn sigpipe_ignored(stdout: &[u8]) -> bool {
 }
 
 #[test]
+#[allow(unsafe_code)]
 fn exec_hands_the_program_sigpipe_at_default() {
     let d = tempfile::tempdir().unwrap();
     let script = sigign_script(d.path());
@@ -106,6 +107,8 @@ fn exec_hands_the_program_sigpipe_at_default() {
     // Positive control: the measurement sees an ignored SIGPIPE.
     use std::os::unix::process::CommandExt;
     let mut c = Command::new(&script);
+    // SAFETY: the pre_exec closure runs in the forked child before exec and
+    // only calls signal(2), which is async-signal-safe and does not allocate.
     unsafe {
         c.pre_exec(|| {
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);

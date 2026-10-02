@@ -15,7 +15,19 @@ fn os_err(what: &str) -> String {
     format!("{what}: {}", std::io::Error::last_os_error())
 }
 
+#[allow(unsafe_code)]
 pub fn read_filters(pid: i32) -> Result<(Vec<Filter>, Duration), String> {
+    // SAFETY: ptrace(2) and waitpid(2) on a foreign pid; the kernel checks
+    // the pid and our rights and answers with an error. The only pointers
+    // handed over are `&mut st` (a live local int) and, in the copying
+    // PTRACE_SECCOMP_GET_FILTER, `buf`: a Vec of exactly `n` sock_filter,
+    // where `n` is the instruction count the kernel reported for the same
+    // index one call earlier. The kernel writes the whole filter behind
+    // that index, so this relies on the tracee's filter list being the same
+    // in both calls: the tracee is ptrace-stopped in between (the request
+    // fails with ESRCH otherwise) and cannot install a filter itself. `i`
+    // travels in the address argument as a plain number and is never
+    // dereferenced.
     unsafe {
         let null = std::ptr::null_mut::<libc::c_void>();
         if libc::ptrace(libc::PTRACE_SEIZE, pid, null, null) < 0 {
@@ -88,12 +100,18 @@ pub fn checked(read: Result<Vec<Filter>, String>, reported: u32) -> Result<Vec<F
     Ok(f)
 }
 
+#[allow(unsafe_code)]
 pub fn load_filters(filters: &[Filter]) -> Result<(), String> {
     for (i, f) in filters.iter().enumerate().rev() {
         let prog = libc::sock_fprog {
             len: f.0.len() as u16,
             filter: f.0.as_ptr() as *mut libc::sock_filter,
         };
+        // SAFETY: seccomp(2) reads `prog` and the `len` instructions behind
+        // `prog.filter` and keeps its own copy; both are borrowed from `f`,
+        // which outlives the call. `len` is never more than the Vec's length
+        // (the cast to u16 can only shorten it), and the kernel only reads
+        // through the `*mut` the struct asks for.
         let r = unsafe {
             libc::syscall(
                 libc::SYS_seccomp,
@@ -143,7 +161,13 @@ mod tests {
         ])
     }
 
+    #[allow(unsafe_code)]
     fn in_child(f: impl FnOnce() -> i32) -> i32 {
+        // SAFETY: fork(2) in a test process that has other threads: the
+        // child runs only `f` and leaves with _exit, so no destructor and no
+        // atexit handler of the parent runs twice. `f` may allocate, which
+        // glibc supports after fork (it resets the malloc locks in the
+        // child). `&mut st` is a live local int for waitpid.
         unsafe {
             let pid = libc::fork();
             assert!(pid >= 0);
@@ -176,7 +200,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn loaded_filter_takes_effect() {
+        // SAFETY: prctl(2) and getppid(2) take no pointers; __errno_location
+        // returns this thread's errno, valid for as long as the thread lives.
         let code = in_child(|| unsafe {
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return 10;
@@ -253,7 +280,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn filters_read_back_as_loaded_or_skip_with_reason() {
+        // SAFETY: fork(2) in a test process that has other threads: the
+        // child builds one filter (an allocation, which glibc supports after
+        // fork), loads it and pauses until SIGKILL; it never returns into
+        // the test harness. The parent's kill and waitpid name the pid fork
+        // just returned; waitpid accepts a null status pointer.
         unsafe {
             let pid = libc::fork();
             if pid == 0 {
