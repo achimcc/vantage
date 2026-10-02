@@ -8,6 +8,12 @@ use std::time::{Duration, Instant};
 
 const PTRACE_SECCOMP_GET_FILTER: libc::c_uint = 0x420c;
 const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
+/// The longest classic BPF program the kernel accepts (`BPF_MAXINSNS`,
+/// include/uapi/linux/bpf_common.h). PTRACE_SECCOMP_GET_FILTER copies a
+/// whole filter to user space WITHOUT being told how large the buffer is,
+/// so every buffer handed to it holds this many instructions — whatever
+/// the kernel said the length was a moment ago.
+const BPF_MAXINSNS: usize = 4096;
 
 pub struct Filter(pub Vec<libc::sock_filter>);
 
@@ -20,14 +26,13 @@ pub fn read_filters(pid: i32) -> Result<(Vec<Filter>, Duration), String> {
     // SAFETY: ptrace(2) and waitpid(2) on a foreign pid; the kernel checks
     // the pid and our rights and answers with an error. The only pointers
     // handed over are `&mut st` (a live local int) and, in the copying
-    // PTRACE_SECCOMP_GET_FILTER, `buf`: a Vec of exactly `n` sock_filter,
-    // where `n` is the instruction count the kernel reported for the same
-    // index one call earlier. The kernel writes the whole filter behind
-    // that index, so this relies on the tracee's filter list being the same
-    // in both calls: the tracee is ptrace-stopped in between (the request
-    // fails with ESRCH otherwise) and cannot install a filter itself. `i`
-    // travels in the address argument as a plain number and is never
-    // dereferenced.
+    // PTRACE_SECCOMP_GET_FILTER, `buf`: a Vec of BPF_MAXINSNS sock_filter.
+    // The kernel writes the whole filter behind the index and never more
+    // than BPF_MAXINSNS instructions — it accepts no longer program — so the
+    // write stays inside `buf` whichever filter the index names by then.
+    // That matters: only the seized THREAD is stopped, and the length asked
+    // for one call earlier is not a promise about this one. `i` travels in
+    // the address argument as a plain number and is never dereferenced.
     unsafe {
         let null = std::ptr::null_mut::<libc::c_void>();
         if libc::ptrace(libc::PTRACE_SEIZE, pid, null, null) < 0 {
@@ -57,18 +62,30 @@ pub fn read_filters(pid: i32) -> Result<(Vec<Filter>, Duration), String> {
                         jf: 0,
                         k: 0
                     };
-                    n as usize
+                    BPF_MAXINSNS
                 ];
-                if libc::ptrace(
+                let copied = libc::ptrace(
                     PTRACE_SECCOMP_GET_FILTER,
                     pid,
                     i as *mut libc::c_void,
                     buf.as_mut_ptr() as *mut libc::c_void,
-                ) != n
-                {
+                );
+                if copied < 0 {
                     result = Err(os_err("PTRACE_SECCOMP_GET_FILTER (copy)"));
                     break;
                 }
+                // A filter list that moved between the two calls is not the
+                // one this copy set out to read: say so instead of keeping
+                // a mix of two states.
+                if copied != n {
+                    result = Err(format!(
+                        "PTRACE_SECCOMP_GET_FILTER[{i}]: the filter changed while it was read \
+                         ({n} instructions, then {copied})"
+                    ));
+                    break;
+                }
+                buf.truncate(copied as usize);
+                buf.shrink_to_fit();
                 out.push(Filter(buf));
             }
             if result.is_ok() {
