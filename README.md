@@ -73,7 +73,7 @@ there is no re-exec: the forked child reads the files itself (see below).
 ```
 $ vantage run web --as-service sftpgo.service -- ls -la /uploads
 vantage: as sftpgo.service (pid 284): ns=all uid=950 gid=9000 groups=9000,950,+109000(unmapped) \
-  caps=0x400 umask=0002 nnp seccomp=36 · NOT: lsm,rlimits,securebits,keyring,seccomp-flags
+  caps=0x400 umask=0002 nnp seccomp=36 · NOT: lsm,rlimits,securebits,keyring,nice,ioprio,seccomp-flags
 ```
 
 Plain `run` puts the program inside the guest; `--as-service <unit>` puts it
@@ -135,8 +135,14 @@ compromised guest can have a harmless process of its own replicated —
 `--as-service` measures a guest's sandbox, it is not evidence *against* the
 guest.
 
+The service's **working directory** is reproduced (since 0.3.2), so a
+relative path means what it means to the service; the program's **stdin is
+`/dev/null`** — after `execve` it is guest code and must not read what the
+operator types.
+
 Not reproduced, and said so on the report line after `NOT:`: **LSM labels**,
-**rlimits**, **securebits**, the **keyring**, and — where filters were
+**rlimits**, **securebits**, the **keyring**, the **nice value**, the **I/O
+scheduling class** (`nice,ioprio`), and — where filters were
 copied — the **flags** a seccomp filter was loaded with (`LOG`,
 `SPEC_ALLOW`, `NEW_LISTENER`). The service's own **environment is never copied** — it can
 carry secrets; the child gets only `PATH=/run/current-system/sw/bin`. While
@@ -237,7 +243,8 @@ found in the guest's profile, **126** program not executable.
   otherwise). Without headers, and with `--as-service`, it does not.
 - Runs as **root on the host**.
 - `--as-service` does not reproduce **LSM labels**, **rlimits**,
-  **securebits**, the **keyring** or **seccomp filter flags**; the report
+  **securebits**, the **keyring**, **nice/ioprio** or **seccomp filter
+  flags**; the report
   line says so. Which process it replicates is the guest's choice (MainPID
   from the guest's systemd).
 - `probe`'s verdict belongs to the source guest, except `dropped at zone

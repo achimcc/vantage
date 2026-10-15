@@ -23,8 +23,16 @@
 //! * With --header/--header-file the child itself — as the service user, in
 //!   the service's mount namespace and root — reads the files and hands curl
 //!   a curlrc in a memfd; there is no re-exec of vantage on this path.
+//! * The working directory is reproduced: `/proc/<pid>/cwd` is opened
+//!   before the namespace switch and the child enters it after the chroot,
+//!   so a relative path measures what the service would open (audit 4,
+//!   B216).
+//! * stdin of the program is `/dev/null`, opened on the host before the
+//!   switch: the replica runs as guest code after `execve` and must not read
+//!   what the operator types (audit 4, B217).
 //! * Not reproduced, and said so in the report line: LSM labels, rlimits,
-//!   securebits, the keyring and seccomp's filter flags.
+//!   securebits, the keyring, the nice value, the I/O scheduling class and
+//!   seccomp's filter flags.
 //! * Der Zielprozess wird direkt nach der Auswahl per pidfd festgehalten;
 //!   bevor der erste Namensraum betreten wird, muss er (ueber das pidfd, in
 //!   `/proc/self/fdinfo`) noch leben, dieselbe Gast-PID haben und sein
@@ -83,7 +91,7 @@ pub fn report_line(
     // Securebits, Schluesselbund und die Flags der Seccomp-Filter (LOG,
     // SPEC_ALLOW, NEW_LISTENER) bildet vantage nie nach (B108); die Flags
     // werden nur genannt, wo Filter kopiert wurden.
-    let base = "lsm,rlimits,securebits,keyring";
+    let base = "lsm,rlimits,securebits,keyring,nice,ioprio";
     let not = match (not_sc, sc.as_str()) {
         (Some(e), _) => format!("{base},seccomp ({e})"),
         (None, "none") => base.to_string(),
@@ -142,6 +150,39 @@ pub fn same_ns(fd: &std::fs::File, path: &str) -> Result<bool, std::io::Error> {
     let a = fd.metadata()?;
     let b = std::fs::metadata(path)?;
     Ok(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
+/// Not dumpable from here on, read back (audit 3 B82; behaviour test since
+/// audit 4 B215). A `prctl` that returned 0 but left the process dumpable
+/// would reopen the window guest root could ptrace into — so the value is
+/// asked for again instead of trusting the return code.
+#[allow(unsafe_code)]
+fn make_undumpable() -> Result<(), std::io::Error> {
+    // SAFETY: prctl(2) with integer arguments only, no pointers.
+    unsafe {
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        match libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) {
+            0 => Ok(()),
+            v if v < 0 => Err(std::io::Error::last_os_error()),
+            v => Err(std::io::Error::other(format!(
+                "PR_GET_DUMPABLE says {v} after PR_SET_DUMPABLE 0"
+            ))),
+        }
+    }
+}
+
+/// Puts `null` (an open `/dev/null`) on fd 0 (audit 4, B217). Without it the
+/// program — guest code once `execve` ran — inherits the operator's
+/// terminal or ssh channel and can read what is typed there.
+#[allow(unsafe_code)]
+fn detach_stdin(null: libc::c_int) -> Result<(), std::io::Error> {
+    // SAFETY: dup2(2) on two descriptors, no pointers; `null` is open.
+    if unsafe { libc::dup2(null, 0) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// dev/inode of the directory `/proc/<pid>/root` resolves to, from the
@@ -354,6 +395,31 @@ pub fn run_as_service(
         eprintln!("vantage: /proc/{host_pid}/root: {e}");
         return tool;
     }
+    // The service's working directory (B216), taken the same way: a
+    // relative path in the measurement must mean what it means to the
+    // service, not `/`.
+    let cwd_path = cstr(&format!("/proc/{host_pid}/cwd"));
+    // SAFETY: `cwd_path` is a NUL-terminated CString that outlives the call.
+    let cwdfd = unsafe {
+        libc::open(
+            cwd_path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if cwdfd < 0 {
+        let e = std::io::Error::last_os_error();
+        eprintln!("vantage: /proc/{host_pid}/cwd: {e}");
+        return tool;
+    }
+    // stdin for the program (B217), opened on the HOST: a confined root
+    // need not have a /dev/null of its own.
+    // SAFETY: a static NUL-terminated C string literal.
+    let nullfd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if nullfd < 0 {
+        let e = std::io::Error::last_os_error();
+        eprintln!("vantage: /dev/null: {e}");
+        return tool;
+    }
     // Everything is opened: is it still the same process? A restart in
     // between would have us join a stranger's (or no) namespaces. Gefragt
     // wird das pidfd, nicht die Nummer (B108).
@@ -394,7 +460,7 @@ pub fn run_as_service(
     // execve or _exit; setgroups reads `st.groups.len()` gids from that very
     // Vec; setns gets descriptors of the still-open files in `fds`; `rootfd`
     // is the open O_PATH descriptor from above and is closed once, in the
-    // child, after its last use;
+    // child, after its last use, like `cwdfd` and `nullfd`;
     // capset reads a `repr(C)` header and the two data elements that
     // _LINUX_CAPABILITY_VERSION_3 expects; `&mut s` is a live local int.
     unsafe {
@@ -408,8 +474,8 @@ pub fn run_as_service(
         // ptrace needs CAP_SYS_PTRACE in the namespace mm->user_ns names: the
         // host's. `execve` of the target resets it (runc's nsexec does the
         // same). Set here, it covers the parent and is inherited by the child.
-        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
-            fail("PR_SET_DUMPABLE 0", std::io::Error::last_os_error());
+        if let Err(e) = make_undumpable() {
+            fail("PR_SET_DUMPABLE 0", e);
         }
         if libc::setgroups(st.groups.len(), st.groups.as_ptr()) != 0 {
             fail("setgroups (host gids)", std::io::Error::last_os_error());
@@ -461,6 +527,13 @@ pub fn run_as_service(
             fail("chdir /", std::io::Error::last_os_error());
         }
         libc::close(rootfd);
+        if libc::fchdir(cwdfd) != 0 {
+            fail(
+                "fchdir to the service's working directory",
+                std::io::Error::last_os_error(),
+            );
+        }
+        libc::close(cwdfd);
         for cap in 0..=last_cap {
             if (st.cap_bnd >> cap) & 1 == 0
                 && libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) != 0
@@ -542,6 +615,10 @@ pub fn run_as_service(
         } else {
             argv_p.as_ptr()
         };
+        if let Err(e) = detach_stdin(nullfd) {
+            fail("stdin to /dev/null", e);
+        }
+        libc::close(nullfd);
         if let Err(e) = seccomp::load_filters(&filters) {
             eprintln!("vantage: {e}");
             libc::_exit(crate::app::EXIT_TOOL);
@@ -568,7 +645,8 @@ mod tests {
     /// B82: the process stops being dumpable BEFORE it enters the first
     /// namespace and before the fork -- the window guest root could ptrace
     /// into. Entering namespaces needs root, so this guards the order in the
-    /// source; the hostile-guest VM test checks the behaviour.
+    /// source; `make_undumpable_leaves_the_process_undumpable` checks the
+    /// behaviour of the call itself (B215).
     #[test]
     fn not_dumpable_before_the_first_setns_and_the_fork() {
         let src = include_str!("service.rs");
@@ -577,9 +655,66 @@ mod tests {
             code.find(needle)
                 .unwrap_or_else(|| panic!("{needle} missing from service.rs"))
         };
-        let dumpable = at("libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0)");
+        let dumpable = at("if let Err(e) = make_undumpable()");
         assert!(dumpable < at("libc::setns("), "PR_SET_DUMPABLE after setns");
         assert!(dumpable < at("libc::fork()"), "PR_SET_DUMPABLE after fork");
+    }
+
+    /// B215: read the value back in a forked child, not the source text.
+    #[test]
+    fn make_undumpable_leaves_the_process_undumpable() {
+        let code = crate::seccomp::tests::in_child(|| {
+            if make_undumpable().is_err() {
+                return 2;
+            }
+            // SAFETY: prctl(2) with integer arguments only.
+            #[allow(unsafe_code)]
+            let v = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+            if v == 0 {
+                0
+            } else {
+                1
+            }
+        });
+        assert_eq!(code, 0, "the child is still dumpable (or prctl failed)");
+    }
+
+    /// B217: after `detach_stdin`, fd 0 is /dev/null — a read is EOF at
+    /// once, however much the operator's stdin would have held.
+    #[test]
+    fn detach_stdin_puts_dev_null_on_fd_0() {
+        use std::os::fd::AsRawFd;
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let raw = null.as_raw_fd();
+        let expect = std::fs::metadata("/dev/null").unwrap();
+        let code = crate::seccomp::tests::in_child(move || {
+            if detach_stdin(raw).is_err() {
+                return 2;
+            }
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::metadata("/proc/self/fd/0") {
+                Ok(m) if m.rdev() == expect.rdev() => 0,
+                _ => 1,
+            }
+        });
+        assert_eq!(code, 0, "fd 0 is not /dev/null after detach_stdin");
+    }
+
+    /// B216, B217: the working directory is entered after the chroot (a
+    /// relative path inside the root), stdin goes to /dev/null before
+    /// seccomp is loaded (dup2 may be filtered) and before execve. Needs
+    /// root to run for real, so the order is guarded here.
+    #[test]
+    fn cwd_after_chroot_and_stdin_before_seccomp_and_exec() {
+        let src = include_str!("service.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        let at = |needle: &str| {
+            code.find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing from service.rs"))
+        };
+        assert!(at("libc::chroot(") < at("libc::fchdir(cwdfd)"));
+        assert!(at("detach_stdin(nullfd)") < at("seccomp::load_filters(&filters)"));
+        assert!(at("detach_stdin(nullfd)") < at("libc::execve("));
     }
 
     #[test]
@@ -617,7 +752,7 @@ mod tests {
         assert_eq!(
             l,
             "vantage: as sftpgo.service (pid 284): ns=all uid=950 gid=9000 \
-                       groups=9000,950,+109000(unmapped) caps=0x400 umask=0002 nnp seccomp=36 · NOT: lsm,rlimits,securebits,keyring,seccomp-flags"
+                       groups=9000,950,+109000(unmapped) caps=0x400 umask=0002 nnp seccomp=36 · NOT: lsm,rlimits,securebits,keyring,nice,ioprio,seccomp-flags"
         );
         let l = report_line(
             "x.service",
@@ -636,7 +771,7 @@ mod tests {
         assert!(l.contains("nnp(added)"), "{l}");
         assert!(
             l.ends_with(
-                "NOT: lsm,rlimits,securebits,keyring,seccomp (PTRACE_SEIZE: Operation not permitted)"
+                "NOT: lsm,rlimits,securebits,keyring,nice,ioprio,seccomp (PTRACE_SEIZE: Operation not permitted)"
             ),
             "{l}"
         );
@@ -659,7 +794,10 @@ mod tests {
             false,
         );
         assert!(l.contains("umask=0022 no-nnp seccomp=none"), "{l}");
-        assert!(l.ends_with("NOT: lsm,rlimits,securebits,keyring"), "{l}");
+        assert!(
+            l.ends_with("NOT: lsm,rlimits,securebits,keyring,nice,ioprio"),
+            "{l}"
+        );
         assert!(!l.contains("root="), "{l}");
     }
 
@@ -675,7 +813,7 @@ mod tests {
         };
         let l = report_line("c.service", 7, 1, 1, &g, &st, &Ok(0), false, true);
         assert!(
-            l.contains("seccomp=none root=own · NOT: lsm,rlimits,securebits,keyring"),
+            l.contains("seccomp=none root=own · NOT: lsm,rlimits,securebits,keyring,nice,ioprio"),
             "{l}"
         );
     }

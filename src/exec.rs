@@ -50,10 +50,12 @@ pub fn run(a: &ExecArgs) -> i32 {
             return crate::app::EXIT_TOOL;
         }
     };
+    // stdin is /dev/null on this path too (audit 4, B217).
     let err = std::process::Command::new(&a.program)
         .arg("-K")
         .arg(format!("/proc/self/fd/{fd}"))
         .args(&a.args)
+        .stdin(std::process::Stdio::null())
         .exec();
     exec_error_code(&a.program, &err)
 }

@@ -99,11 +99,18 @@ pub fn exec_203(guest: &str, program: &str, reexec: bool) -> (i32, String) {
     )
 }
 
-/// Runs with inherited stdio; returns the program's exit code. `reexec`:
-/// `program` is vantage itself (`__exec`), not the user's program.
+/// Runs with inherited stdout/stderr; returns the program's exit code.
+/// `reexec`: `program` is vantage itself (`__exec`), not the user's program.
+///
+/// stdin is `/dev/null` here as well (audit 4, B217): `systemd-run --pipe`
+/// would hand the caller's stdin to the guest program, and a transient unit
+/// without `--pty` already gets null — this makes it explicit on both paths,
+/// so a guest program can never read the operator's terminal or the pipe of
+/// a tool call.
 pub fn run_in_guest(guest: &str, program: &str, args: &[String], reexec: bool) -> i32 {
     let st = std::process::Command::new(format!("{PROFILE}/systemd-run"))
         .args(systemd_run_argv(guest, program, args))
+        .stdin(std::process::Stdio::null())
         .status();
     match st {
         Ok(s) => match s.code() {

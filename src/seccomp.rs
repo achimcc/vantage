@@ -17,6 +17,27 @@ const BPF_MAXINSNS: usize = 4096;
 
 pub struct Filter(pub Vec<libc::sock_filter>);
 
+/// The buffer the copying PTRACE_SECCOMP_GET_FILTER writes into.
+///
+/// ALWAYS BPF_MAXINSNS, NEVER `reported` (audit 3 B149, test since audit 4
+/// B215). `reported` is what the counting call returned a moment earlier;
+/// only the seized thread is stopped, so by the copying call the index can
+/// name a longer filter, and the kernel writes all of it without knowing the
+/// buffer's size. The argument is taken only so that a rewrite to "the size
+/// the kernel just told us" has a place to happen — and a test to fail.
+pub(crate) fn copy_buffer(reported: usize) -> Vec<libc::sock_filter> {
+    let _ = reported;
+    vec![
+        libc::sock_filter {
+            code: 0,
+            jt: 0,
+            jf: 0,
+            k: 0
+        };
+        BPF_MAXINSNS
+    ]
+}
+
 fn os_err(what: &str) -> String {
     format!("{what}: {}", std::io::Error::last_os_error())
 }
@@ -55,15 +76,7 @@ pub fn read_filters(pid: i32) -> Result<(Vec<Filter>, Duration), String> {
                     }
                     break;
                 }
-                let mut buf = vec![
-                    libc::sock_filter {
-                        code: 0,
-                        jt: 0,
-                        jf: 0,
-                        k: 0
-                    };
-                    BPF_MAXINSNS
-                ];
+                let mut buf = copy_buffer(n as usize);
                 let copied = libc::ptrace(
                     PTRACE_SECCOMP_GET_FILTER,
                     pid,
@@ -145,8 +158,23 @@ pub fn load_filters(filters: &[Filter]) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// B215: the copy buffer is as large as any filter the kernel accepts,
+    /// whatever length the counting call reported — a filter that grew
+    /// between the two calls must not be written past the end.
+    #[test]
+    fn the_copy_buffer_holds_the_longest_filter_whatever_was_reported() {
+        for reported in [0usize, 1, 4, 36, 4095] {
+            assert_eq!(
+                copy_buffer(reported).len(),
+                BPF_MAXINSNS,
+                "a buffer sized by the reported length ({reported}) overflows \
+                 when the filter changes before the copy"
+            );
+        }
+    }
 
     /// Returns EPERM for getppid, allows everything else.
     fn deny_getppid() -> Filter {
@@ -179,7 +207,7 @@ mod tests {
     }
 
     #[allow(unsafe_code)]
-    fn in_child(f: impl FnOnce() -> i32) -> i32 {
+    pub(crate) fn in_child(f: impl FnOnce() -> i32) -> i32 {
         // SAFETY: fork(2) in a test process that has other threads: the
         // child runs only `f` and leaves with _exit, so no destructor and no
         // atexit handler of the parent runs twice. `f` may allocate, which

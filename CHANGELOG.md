@@ -3,6 +3,31 @@
 Frühere Versionen (bis 0.2.1) sind nur in den Commit-Nachrichten beschrieben
 (`git log`).
 
+## 0.3.2 — 2026-10-16
+
+Audit 4 des Homeservers (2026-10-15), drei low-Befunde zu `--as-service`.
+
+### B215: B149- und B82-Fix mit Verhaltenstest
+
+- Der Kopierpuffer für `PTRACE_SECCOMP_GET_FILTER` kommt aus `copy_buffer`
+  und ist immer `BPF_MAXINSNS` lang; ein Test wird rot, sobald er nach der
+  zuvor gemeldeten Länge bemessen wird (Mutante gefahren).
+- `make_undumpable` setzt `PR_SET_DUMPABLE 0` und liest den Wert mit
+  `PR_GET_DUMPABLE` zurück; der Test prüft das in einem geforkten Kind statt
+  im Quelltext.
+
+### B216: Arbeitsverzeichnis des Dienstes
+
+- `/proc/<pid>/cwd` wird vor dem Namensraumwechsel geöffnet, das Kind
+  wechselt nach dem `chroot` hinein. Nice-Wert und I/O-Klasse stehen jetzt
+  unter `NOT:` (`nice,ioprio`).
+
+### B217: stdin des Programms ist `/dev/null`
+
+- Auf dem Wirt geöffnet und vor dem Laden der Seccomp-Filter auf fd 0
+  gelegt; das nachgebildete Programm liest nicht mehr mit, was der Betreiber
+  tippt.
+
 ## 0.3.0 — 2026-09-29
 
 Audit 3 des Homeservers (2026-09-27), zwei low-Befunde.
