@@ -16,20 +16,135 @@ pub fn resolve_program(p: &str) -> String {
 }
 
 pub fn systemd_run_argv(guest: &str, program: &str, args: &[String]) -> Vec<String> {
+    systemd_run_argv_with(guest, &[], program, args)
+}
+
+/// Like `systemd_run_argv`, with unit properties (`-p Name=value`) placed
+/// before `--`. `RuntimeMaxSec=`, `User=`, `LoadCredential=` go here; the
+/// three switches stay, whatever the caller adds.
+pub fn systemd_run_argv_with(
+    guest: &str,
+    properties: &[String],
+    program: &str,
+    args: &[String],
+) -> Vec<String> {
     let mut v: Vec<String> = [
         &format!("--machine={guest}"),
         "--wait",
         "--pipe",
         "--quiet",
         "--collect",
-        "--",
-        program,
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
+    for p in properties {
+        v.push("-p".to_string());
+        v.push(p.clone());
+    }
+    v.push("--".to_string());
+    v.push(program.to_string());
     v.extend(args.iter().cloned());
     v
+}
+
+/// Why a guest command yielded no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestError {
+    /// systemd-run answered 203/EXEC: the program is not in the guest's
+    /// profile (or not executable — systemd does not tell them apart).
+    NotInProfile { guest: String, program: String },
+    /// The host side failed: spawn, timeout, output cap.
+    Capture(crate::capture::CaptureError),
+}
+
+impl std::fmt::Display for GuestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GuestError::NotInProfile { guest, program } => {
+                write!(f, "{program} is not in the profile of {guest} (203/EXEC)")
+            }
+            GuestError::Capture(e) => write!(f, "systemd-run: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for GuestError {}
+
+impl From<crate::capture::CaptureError> for GuestError {
+    fn from(e: crate::capture::CaptureError) -> Self {
+        GuestError::Capture(e)
+    }
+}
+
+/// A command in a guest, run from the host with its output captured — the
+/// library form of `vantage run` for tools that read the answer instead of
+/// showing it (gast-pruefung, signoff). The program is resolved like on the
+/// command line: an absolute path as given, anything else in the guest's
+/// system profile. stdin is `/dev/null` unless the caller passes bytes
+/// (a curlrc, a JSON-RPC request) — never the operator's terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestCommand {
+    pub guest: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub properties: Vec<String>,
+}
+
+impl GuestCommand {
+    pub fn new(guest: &str, program: &str) -> Self {
+        GuestCommand {
+            guest: guest.to_string(),
+            program: resolve_program(program),
+            args: Vec::new(),
+            properties: Vec::new(),
+        }
+    }
+
+    pub fn arg(mut self, a: impl Into<String>) -> Self {
+        self.args.push(a.into());
+        self
+    }
+
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// A property of the transient unit (`-p Name=value`).
+    pub fn property(mut self, p: impl Into<String>) -> Self {
+        self.properties.push(p.into());
+        self
+    }
+
+    /// The argv for `systemd-run`, three switches included.
+    pub fn argv(&self) -> Vec<String> {
+        systemd_run_argv_with(&self.guest, &self.properties, &self.program, &self.args)
+    }
+
+    /// Runs it and captures the answer under `limits`. 203/EXEC becomes
+    /// `GuestError::NotInProfile`; every other exit code is the program's
+    /// and comes back in `Captured`.
+    pub fn capture(
+        &self,
+        stdin: Option<&[u8]>,
+        limits: crate::capture::Limits,
+    ) -> Result<crate::capture::Captured, GuestError> {
+        let mut cmd = std::process::Command::new(format!("{PROFILE}/systemd-run"));
+        cmd.args(self.argv());
+        let out = crate::capture::run(&mut cmd, stdin, limits)?;
+        if out.code == Some(203) {
+            return Err(GuestError::NotInProfile {
+                guest: self.guest.clone(),
+                program: self.program.clone(),
+            });
+        }
+        Ok(out)
+    }
 }
 
 pub fn exec_args(self_exe: &str, r: &RunArgs) -> (String, Vec<String>) {
@@ -157,6 +272,75 @@ mod tests {
                 "-sS"
             ])
         );
+    }
+    #[test]
+    fn properties_go_before_the_double_dash() {
+        let a = systemd_run_argv_with(
+            "g",
+            &v(&["RuntimeMaxSec=600", "User=sonarr"]),
+            "/p/cat",
+            &v(&["/etc/machine-id"]),
+        );
+        assert_eq!(
+            a,
+            v(&[
+                "--machine=g",
+                "--wait",
+                "--pipe",
+                "--quiet",
+                "--collect",
+                "-p",
+                "RuntimeMaxSec=600",
+                "-p",
+                "User=sonarr",
+                "--",
+                "/p/cat",
+                "/etc/machine-id"
+            ])
+        );
+    }
+    #[test]
+    fn guest_command_resolves_the_program_and_builds_the_argv() {
+        let c = GuestCommand::new("media-01", "curl")
+            .args(["-sS", "-K", "-"])
+            .property("RuntimeMaxSec=600");
+        assert_eq!(c.program, "/run/current-system/sw/bin/curl");
+        assert_eq!(
+            c.argv(),
+            v(&[
+                "--machine=media-01",
+                "--wait",
+                "--pipe",
+                "--quiet",
+                "--collect",
+                "-p",
+                "RuntimeMaxSec=600",
+                "--",
+                "/run/current-system/sw/bin/curl",
+                "-sS",
+                "-K",
+                "-"
+            ])
+        );
+        let c = GuestCommand::new("g", "/nix/store/x/bin/y").arg("z");
+        assert_eq!(c.program, "/nix/store/x/bin/y");
+        assert_eq!(c.args, v(&["z"]));
+    }
+    #[test]
+    fn guest_errors_name_guest_and_program() {
+        let e = GuestError::NotInProfile {
+            guest: "koch-01".into(),
+            program: "/run/current-system/sw/bin/curl".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "/run/current-system/sw/bin/curl is not in the profile of koch-01 (203/EXEC)"
+        );
+        let e: GuestError = crate::capture::CaptureError::TimedOut {
+            timeout: std::time::Duration::from_secs(5),
+        }
+        .into();
+        assert!(e.to_string().starts_with("systemd-run: "), "{e}");
     }
     #[test]
     fn exec_args_carry_paths_not_values() {

@@ -252,6 +252,38 @@ found in the guest's profile, **126** program not executable.
 - While `vantage` reads a service's seccomp filters via `ptrace`, that
   service is paused — measured 174–524 µs.
 
+## As a library
+
+Since 0.4.0 the crate is also a library for tools that run commands in
+guests and *read* the answer instead of showing it — on the homeserver
+`gast-pruefung` and `signoff`, which until then each carried their own copy
+of the systemd-run argv, the curl quoting and the capture loop.
+
+```toml
+[dependencies]
+vantage = { git = "https://github.com/achimcc/vantage", tag = "v0.4.0", version = "0.4.0" }
+```
+
+`version` beside the tag: without it Cargo's requirement is `*`, and a
+`cargo deny` with `wildcards = "deny"` refuses it.
+
+- `guest_run::GuestCommand::new(guest, program).args(…).property("RuntimeMaxSec=600")`
+  — a command in a guest; `argv()` is the systemd-run argv with the three
+  switches, `capture(stdin, limits)` runs it and returns `Captured`
+  (`code`, `stdout`, `stderr`). 203/EXEC comes back as
+  `GuestError::NotInProfile`, the host side's failures as
+  `GuestError::Capture`.
+- `capture::run(cmd, stdin, Limits)` — any `Command`, under a timeout and
+  a per-stream byte cap; a flood or a hang is an error, never a partial
+  answer. `CaptureError` carries the numbers, so a caller can word the
+  message itself.
+- `curlrc::quote(value)` and `curlrc::CurlRc` — a curl config file for
+  `curl -K -`, one option per line, every value quoted; the way a secret
+  reaches curl without standing in argv. `curlrc::header_from_file` and
+  `exec::curlrc_memfd` are the `--header-file` handling of the binary.
+- `service::run_as_service` — `--as-service` as a function (inherited
+  stdio, the program's exit code).
+
 ## Development
 
 ```
