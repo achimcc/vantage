@@ -254,14 +254,14 @@ found in the guest's profile, **126** program not executable.
 
 ## As a library
 
-Since 0.4.0 the crate is also a library for tools that run commands in
+Since 0.4.0 (0.4.1 for the deadline guarantee below) the crate is also a library for tools that run commands in
 guests and *read* the answer instead of showing it — on the homeserver
 `gast-pruefung` and `signoff`, which until then each carried their own copy
 of the systemd-run argv, the curl quoting and the capture loop.
 
 ```toml
 [dependencies]
-vantage = { git = "https://github.com/achimcc/vantage", tag = "v0.4.0", version = "0.4.0" }
+vantage = { git = "https://github.com/achimcc/vantage", tag = "v0.4.1", version = "0.4.1" }
 ```
 
 `version` beside the tag: without it Cargo's requirement is `*`, and a
@@ -276,7 +276,11 @@ vantage = { git = "https://github.com/achimcc/vantage", tag = "v0.4.0", version 
 - `capture::run(cmd, stdin, Limits)` — any `Command`, under a timeout and
   a per-stream byte cap; a flood or a hang is an error, never a partial
   answer. `CaptureError` carries the numbers, so a caller can word the
-  message itself.
+  message itself. Every thread it starts ends at the deadline and is
+  joined before it returns — a pipe the guest keeps open does not leave a
+  reader behind — and `GuestCommand::capture` sets `RuntimeMaxSec=` to the
+  same timeout, so the guest's systemd ends the unit the host stopped
+  waiting for (killing `systemd-run` alone would not).
 - `curlrc::quote(value)` and `curlrc::CurlRc` — a curl config file for
   `curl -K -`, one option per line, every value quoted; the way a secret
   reaches curl without standing in argv. `curlrc::header_from_file` and

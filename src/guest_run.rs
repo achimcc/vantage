@@ -126,6 +126,27 @@ impl GuestCommand {
         systemd_run_argv_with(&self.guest, &self.properties, &self.program, &self.args)
     }
 
+    /// The argv `capture` runs: `argv()` plus `RuntimeMaxSec=<timeout>`
+    /// as the first property, unless the caller set one. The host-side
+    /// timeout kills only the `systemd-run` client; the transient unit in
+    /// the guest would run on. With `RuntimeMaxSec=` the guest's systemd
+    /// ends it at the same limit — the guest's systemd, so a hostile guest
+    /// can ignore it, but a well-behaved one does not leak a unit per
+    /// aborted command (review finding of 2026-10-17).
+    pub fn argv_under(&self, limits: crate::capture::Limits) -> Vec<String> {
+        if self
+            .properties
+            .iter()
+            .any(|p| p.starts_with("RuntimeMaxSec="))
+        {
+            return self.argv();
+        }
+        let secs = limits.timeout.as_secs().max(1);
+        let mut props = vec![format!("RuntimeMaxSec={secs}")];
+        props.extend(self.properties.iter().cloned());
+        systemd_run_argv_with(&self.guest, &props, &self.program, &self.args)
+    }
+
     /// Runs it and captures the answer under `limits`. 203/EXEC becomes
     /// `GuestError::NotInProfile`; every other exit code is the program's
     /// and comes back in `Captured`.
@@ -135,7 +156,7 @@ impl GuestCommand {
         limits: crate::capture::Limits,
     ) -> Result<crate::capture::Captured, GuestError> {
         let mut cmd = std::process::Command::new(format!("{PROFILE}/systemd-run"));
-        cmd.args(self.argv());
+        cmd.args(self.argv_under(limits));
         let out = crate::capture::run(&mut cmd, stdin, limits)?;
         if out.code == Some(203) {
             return Err(GuestError::NotInProfile {
@@ -325,6 +346,30 @@ mod tests {
         let c = GuestCommand::new("g", "/nix/store/x/bin/y").arg("z");
         assert_eq!(c.program, "/nix/store/x/bin/y");
         assert_eq!(c.args, v(&["z"]));
+    }
+    #[test]
+    fn capture_sets_runtime_max_sec_to_the_timeout_unless_the_caller_did() {
+        use crate::capture::Limits;
+        let l = Limits::new(std::time::Duration::from_secs(600), 1 << 20);
+        let c = GuestCommand::new("g", "cat").arg("/etc/machine-id");
+        let a = c.argv_under(l);
+        assert_eq!(&a[5..7], &v(&["-p", "RuntimeMaxSec=600"])[..]);
+        assert_eq!(a[7], "--");
+        // The caller's own value wins, and is not doubled.
+        let c = c.property("RuntimeMaxSec=30").property("User=x");
+        let a = c.argv_under(l);
+        assert_eq!(
+            a.iter().filter(|s| s.starts_with("RuntimeMaxSec=")).count(),
+            1
+        );
+        assert_eq!(
+            &a[5..9],
+            &v(&["-p", "RuntimeMaxSec=30", "-p", "User=x"])[..]
+        );
+        // Sub-second limits still give the unit a whole second.
+        let c = GuestCommand::new("g", "true");
+        let a = c.argv_under(Limits::new(std::time::Duration::from_millis(300), 1));
+        assert!(a.contains(&"RuntimeMaxSec=1".to_string()), "{a:?}");
     }
     #[test]
     fn guest_errors_name_guest_and_program() {

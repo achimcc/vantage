@@ -9,11 +9,24 @@
 //! Until vantage 0.4.0 this loop lived twice, in gast-pruefung and in
 //! signoff; the two copies had drifted in how they treated a stream a
 //! grandchild kept open after the child had exited.
+//!
+//! EVERY THREAD ENDS AT THE DEADLINE (0.4.1). Killing the child closes
+//! nothing on the far side of a pipe: with `systemd-run --pipe` the write
+//! ends belong to the unit in the guest, and a reader blocked in `read(2)`
+//! on such a pipe would sit there as long as the guest pleases — a leaked
+//! thread and an open descriptor per aborted command. The readers and the
+//! stdin writer therefore `poll(2)` with the time that is left, and `run`
+//! joins all of them before it returns, on the error paths too. What the
+//! guest's own unit does after the deadline is the guest's business; a
+//! `GuestCommand` sets `RuntimeMaxSec=` to the same limit so the guest's
+//! systemd ends it as well.
 
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// How long a command may run and how much it may write per stream.
@@ -93,6 +106,112 @@ impl std::fmt::Display for CaptureError {
 
 impl std::error::Error for CaptureError {}
 
+/// Milliseconds left until `deadline`, for `poll(2)`; `None` once it has
+/// passed.
+fn left_ms(deadline: Instant) -> Option<libc::c_int> {
+    let left = deadline.checked_duration_since(Instant::now())?;
+    // At least 1 ms, so a deadline a few microseconds away still polls once.
+    Some(left.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int)
+}
+
+/// Waits until `fd` is ready for `events` or the deadline passes. `true`
+/// means ready (or hung up — a read then returns 0, a write EPIPE).
+#[allow(unsafe_code)]
+fn ready(fd: libc::c_int, events: libc::c_short, deadline: Instant) -> bool {
+    loop {
+        let Some(ms) = left_ms(deadline) else {
+            return false;
+        };
+        let mut p = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: `p` is a valid, initialised pollfd that lives for the
+        // call; nfds is 1; poll writes only into `p.revents`.
+        let rc = unsafe { libc::poll(&mut p, 1, ms) };
+        if rc > 0 {
+            return true;
+        }
+        if rc == 0 {
+            return false;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            // EBADF, EINVAL: nothing more to wait for; let read/write report.
+            return true;
+        }
+    }
+}
+
+/// Reads `r` until EOF, the cap plus one byte, or the deadline — whichever
+/// comes first — and drops it, closing the host's end of the pipe.
+fn read_until<R: Read + AsRawFd>(
+    mut r: R,
+    max_bytes: u64,
+    deadline: Instant,
+    too_much: Arc<AtomicBool>,
+) -> Vec<u8> {
+    let fd = r.as_raw_fd();
+    let mut v = Vec::new();
+    let mut buf = [0u8; 16 << 10];
+    while (v.len() as u64) <= max_bytes {
+        if !ready(fd, libc::POLLIN, deadline) {
+            break;
+        }
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => v.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    if v.len() as u64 > max_bytes {
+        v.truncate(max_bytes as usize);
+        too_much.store(true, Ordering::SeqCst);
+    }
+    v
+}
+
+/// `read_until` in its own thread; `None` (no pipe) yields nothing.
+fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
+    r: Option<R>,
+    max_bytes: u64,
+    deadline: Instant,
+    too_much: Arc<AtomicBool>,
+) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || match r {
+        Some(r) => read_until(r, max_bytes, deadline, too_much),
+        None => Vec::new(),
+    })
+}
+
+/// Writes `bytes` to `w` until done, EPIPE, or the deadline, then drops it.
+fn write_until<W: Write + AsRawFd>(
+    mut w: W,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), std::io::Error> {
+    let fd = w.as_raw_fd();
+    let mut done = 0;
+    while done < bytes.len() {
+        if !ready(fd, libc::POLLOUT, deadline) {
+            return Ok(()); // the deadline, reported by the caller's wait
+        }
+        // At most PIPE_BUF per write: POLLOUT promises that much room, and
+        // a blocking write of MORE than fits blocks until all of it went
+        // through — with a reader that never reads, until the far side
+        // closes (measured: 30 s against `sleep 30`, the deadline ignored).
+        let chunk = bytes.len().min(done + libc::PIPE_BUF);
+        match w.write(&bytes[done..chunk]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Runs `cmd`, feeds it `stdin` (or `/dev/null`), and returns its exit code
 /// and both streams — or why that did not happen.
 ///
@@ -101,7 +220,8 @@ impl std::error::Error for CaptureError {}
 /// reading and sets a flag; the loop below kills the child immediately
 /// instead of letting it wait on a full pipe until the timeout. stdin is
 /// written in a thread as well — a program that does not read would
-/// otherwise hang `write_all` on a full pipe, before any timeout.
+/// otherwise hang `write_all` on a full pipe, before any timeout. Every
+/// thread stops at the deadline and is joined before `run` returns.
 pub fn run(
     cmd: &mut Command,
     stdin: Option<&[u8]>,
@@ -117,40 +237,25 @@ pub fn run(
     let mut child = cmd
         .spawn()
         .map_err(|e| CaptureError::Spawn(e.to_string()))?;
-    let too_much = Arc::new(AtomicBool::new(false));
-    let reader = |r: Option<Box<dyn Read + Send>>| {
-        let too_much = too_much.clone();
-        std::thread::spawn(move || -> Vec<u8> {
-            let Some(mut r) = r else {
-                return Vec::new();
-            };
-            let mut v = Vec::new();
-            let _ = (&mut r).take(max_bytes + 1).read_to_end(&mut v);
-            if v.len() as u64 > max_bytes {
-                v.truncate(max_bytes as usize);
-                too_much.store(true, Ordering::SeqCst);
-            }
-            v
-        })
-    };
-    let out = reader(
-        child
-            .stdout
-            .take()
-            .map(|r| Box::new(r) as Box<dyn Read + Send>),
-    );
-    let err = reader(
-        child
-            .stderr
-            .take()
-            .map(|r| Box::new(r) as Box<dyn Read + Send>),
-    );
-    let writer = stdin.map(|bytes| {
-        let mut pipe = child.stdin.take().expect("stdin was requested");
-        let bytes = bytes.to_vec();
-        std::thread::spawn(move || pipe.write_all(&bytes))
-    });
     let deadline = Instant::now() + timeout;
+    let too_much = Arc::new(AtomicBool::new(false));
+    let out = spawn_reader(child.stdout.take(), max_bytes, deadline, too_much.clone());
+    let err = spawn_reader(child.stderr.take(), max_bytes, deadline, too_much.clone());
+    let writer = stdin.map(|bytes| {
+        let pipe = child.stdin.take().expect("stdin was requested");
+        let bytes = bytes.to_vec();
+        std::thread::spawn(move || write_until(pipe, &bytes, deadline))
+    });
+    // Joins every thread; each ends by the deadline at the latest, so this
+    // cannot hang longer than the limit the caller chose.
+    let finish = |out: JoinHandle<Vec<u8>>,
+                  err: JoinHandle<Vec<u8>>,
+                  writer: Option<JoinHandle<Result<(), std::io::Error>>>| {
+        let o = out.join().unwrap_or_default();
+        let e = err.join().unwrap_or_default();
+        let w = writer.map(|w| w.join().unwrap_or(Ok(())));
+        (o, e, w)
+    };
     let kill = |child: &mut std::process::Child| {
         let _ = child.kill();
         let _ = child.wait();
@@ -158,39 +263,39 @@ pub fn run(
     let status = loop {
         if too_much.load(Ordering::SeqCst) {
             kill(&mut child);
+            finish(out, err, writer);
             return Err(CaptureError::TooMuchOutput { max_bytes });
         }
         match child.try_wait() {
             Ok(Some(s)) => break s,
             Ok(None) if Instant::now() >= deadline => {
                 kill(&mut child);
+                finish(out, err, writer);
                 return Err(CaptureError::TimedOut { timeout });
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(e) => {
                 kill(&mut child);
+                finish(out, err, writer);
                 return Err(CaptureError::Spawn(e.to_string()));
             }
         }
     };
+    // The child is gone. Its pipes can outlive it (a grandchild, the unit
+    // behind `systemd-run --pipe`): the readers stop at the deadline either
+    // way, and a reader that had to is the finding.
+    let (stdout, stderr, written) = finish(out, err, writer);
+    if Instant::now() >= deadline {
+        return Err(CaptureError::OutputHeldOpen { timeout });
+    }
+    if too_much.load(Ordering::SeqCst) {
+        return Err(CaptureError::TooMuchOutput { max_bytes });
+    }
     // (No let chain: the crate is edition 2021.)
-    if let Some(Ok(Err(e))) = writer.map(|w| w.join()) {
+    if let Some(Err(e)) = written {
         if e.kind() != std::io::ErrorKind::BrokenPipe {
             return Err(CaptureError::Stdin(e.to_string()));
         }
-    }
-    // The pipes can outlive the child; wait for them, but only until the
-    // deadline.
-    while !(out.is_finished() && err.is_finished()) {
-        if Instant::now() >= deadline {
-            return Err(CaptureError::OutputHeldOpen { timeout });
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
-    if too_much.load(Ordering::SeqCst) {
-        return Err(CaptureError::TooMuchOutput { max_bytes });
     }
     Ok(Captured {
         code: status.code(),
@@ -238,20 +343,44 @@ mod tests {
         let big = vec![b'x'; 1 << 20];
         let t0 = Instant::now();
         let e = run(&mut sh("sleep 30"), Some(&big), limits(300, 1 << 20));
-        assert!(e.is_err());
+        assert!(matches!(e, Err(CaptureError::TimedOut { .. })), "{e:?}");
         assert!(t0.elapsed() < Duration::from_secs(5));
     }
 
-    /// A grandchild keeps stdout open after the child exited.
+    /// A grandchild keeps stdout open after the child exited. The run ends
+    /// at the deadline — and `run` has JOINED both readers by then: the
+    /// time bound below (well under the grandchild's 30 s) is only possible
+    /// if the readers returned, and a reader that returns drops its `File`
+    /// and so closes the host's end of the pipe although the grandchild
+    /// still holds the far side (review finding of 2026-10-17: readers
+    /// blocked in read(2) outlived the command as detached threads).
     #[test]
-    fn an_output_held_open_ends_at_the_deadline() {
+    fn an_output_held_open_ends_at_the_deadline_with_readers_joined() {
         let t0 = Instant::now();
         let e = run(&mut sh("sleep 30 & exit 0"), None, limits(500, 1 << 20));
         assert!(
             matches!(e, Err(CaptureError::OutputHeldOpen { .. })),
             "{e:?}"
         );
-        assert!(t0.elapsed() < Duration::from_secs(5));
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    }
+
+    /// The same, for a grandchild that holds stdin's read end: the writer
+    /// stops at the deadline instead of blocking on a full pipe forever.
+    #[test]
+    fn a_writer_to_a_held_open_stdin_ends_at_the_deadline() {
+        let big = vec![b'x'; 4 << 20];
+        let t0 = Instant::now();
+        let e = run(
+            &mut sh("sleep 30 <&0 & exit 0"),
+            Some(&big),
+            limits(500, 1 << 20),
+        );
+        assert!(
+            matches!(e, Err(CaptureError::OutputHeldOpen { .. })),
+            "{e:?}"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
     }
 
     /// A program that stops reading stdin early is not an error (EPIPE).
@@ -280,6 +409,40 @@ mod tests {
             (Some(3), "hello\n", "failure\n")
         );
         assert!(!e.success());
+    }
+
+    /// Exactly the cap is still an answer; one byte more is not.
+    #[test]
+    fn the_cap_is_inclusive() {
+        let e = run(
+            &mut sh("head -c 1024 /dev/zero"),
+            None,
+            limits(10_000, 1024),
+        )
+        .unwrap();
+        assert_eq!(e.stdout.len(), 1024);
+        let e = run(
+            &mut sh("head -c 1025 /dev/zero"),
+            None,
+            limits(10_000, 1024),
+        );
+        assert_eq!(e, Err(CaptureError::TooMuchOutput { max_bytes: 1024 }));
+        // stderr counts the same way.
+        let e = run(
+            &mut sh("head -c 5000 /dev/zero >&2"),
+            None,
+            limits(10_000, 1024),
+        );
+        assert_eq!(e, Err(CaptureError::TooMuchOutput { max_bytes: 1024 }));
+    }
+
+    /// Big stdin that IS read goes through whole (gast-pruefung measured
+    /// 140 000 bytes through systemd-run --pipe; here 4 MiB through cat).
+    #[test]
+    fn big_stdin_is_written_whole() {
+        let big = vec![b'y'; 4 << 20];
+        let e = run(&mut sh("cat | wc -c"), Some(&big), limits(10_000, 1 << 20)).unwrap();
+        assert_eq!(e.stdout.trim(), (4 << 20).to_string());
     }
 
     #[test]
