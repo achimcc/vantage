@@ -106,16 +106,21 @@ impl std::fmt::Display for CaptureError {
 
 impl std::error::Error for CaptureError {}
 
-/// Milliseconds left until `deadline`, for `poll(2)`; `None` once it has
-/// passed.
+/// Milliseconds left until `deadline`, for `poll(2)`, rounded UP; `None`
+/// once it has passed.
 fn left_ms(deadline: Instant) -> Option<libc::c_int> {
     let left = deadline.checked_duration_since(Instant::now())?;
-    // At least 1 ms, so a deadline a few microseconds away still polls once.
-    Some(left.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int)
+    let ms = left.as_micros().div_ceil(1000);
+    Some(ms.clamp(1, libc::c_int::MAX as u128) as libc::c_int)
 }
 
 /// Waits until `fd` is ready for `events` or the deadline passes. `true`
-/// means ready (or hung up — a read then returns 0, a write EPIPE).
+/// means ready (or hung up — a read then returns 0, a write EPIPE); `false`
+/// is returned ONLY once `Instant::now() >= deadline`. A `poll` that times
+/// out early (its argument is whole milliseconds) loops: in 0.4.1 it
+/// returned `false` up to a millisecond before the deadline, and `run`
+/// then took a stream a grandchild still held for a closed one — seen as
+/// a flaky test in the Nix sandbox, a wrong `Ok` in production.
 #[allow(unsafe_code)]
 fn ready(fd: libc::c_int, events: libc::c_short, deadline: Instant) -> bool {
     loop {
@@ -133,13 +138,11 @@ fn ready(fd: libc::c_int, events: libc::c_short, deadline: Instant) -> bool {
         if rc > 0 {
             return true;
         }
-        if rc == 0 {
-            return false;
-        }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+        if rc < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             // EBADF, EINVAL: nothing more to wait for; let read/write report.
             return true;
         }
+        // rc == 0 (timed out) or EINTR: back to the clock.
     }
 }
 
@@ -381,6 +384,24 @@ mod tests {
             "{e:?}"
         );
         assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    }
+
+    /// The invariant the readers rely on: `ready` says `false` only once
+    /// the deadline has passed by `Instant` — never a millisecond early.
+    #[test]
+    fn ready_is_false_only_after_the_deadline() {
+        // A pipe nobody writes to: poll can only time out.
+        let mut c = sh("sleep 5");
+        c.stdout(Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        let fd = child.stdout.as_ref().unwrap().as_raw_fd();
+        for us in [1_500u64, 2_300, 100, 0] {
+            let deadline = Instant::now() + Duration::from_micros(us);
+            assert!(!ready(fd, libc::POLLIN, deadline));
+            assert!(Instant::now() >= deadline, "{us} us");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// A program that stops reading stdin early is not an error (EPIPE).

@@ -254,14 +254,14 @@ found in the guest's profile, **126** program not executable.
 
 ## As a library
 
-Since 0.4.0 (0.4.1 for the deadline guarantee below) the crate is also a library for tools that run commands in
+Since 0.4.0 (0.4.2 for the deadline guarantee below) the crate is also a library for tools that run commands in
 guests and *read* the answer instead of showing it — on the homeserver
 `gast-pruefung` and `signoff`, which until then each carried their own copy
 of the systemd-run argv, the curl quoting and the capture loop.
 
 ```toml
 [dependencies]
-vantage = { git = "https://github.com/achimcc/vantage", tag = "v0.4.1", version = "0.4.1" }
+vantage = { git = "https://github.com/achimcc/vantage", tag = "v0.4.2", version = "0.4.2" }
 ```
 
 `version` beside the tag: without it Cargo's requirement is `*`, and a
